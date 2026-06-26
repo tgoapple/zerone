@@ -44,6 +44,11 @@ def _extract_html(text: str) -> str | None:
     return None
 
 
+def _contains_any(text: str, phrases: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in phrases)
+
+
 # ── Session / Memory stores ────────────────────────────────
 
 class SessionStore:
@@ -326,20 +331,27 @@ def _load_persona(path: Path) -> dict[str, Any]:
 
 # ── Skill system (file-based toolkits) ─────────────────────
 
-SKILL_AGENT_PROMPT = """You decide which tool to call next. Return only a JSON object:
+SKILL_AGENT_PROMPT = """You complete tasks by using tools. You must call at least one tool before you can say you're done. Do not describe what you will do — do it.
+
+Return only a JSON object:
 
 - "kind": "tool" or "final"
-- "tool": the tool name
+- "tool": the tool name (must be one of the available tools)
 - "args": object with the tool's arguments
-- "reason": short explanation
+- "reason": short explanation of what this step does
 
 Available tools:
 
 {tool_schemas}
 
-When done, return {"kind": "final", "message": "summary"}.
+Rules:
+- Never return "final" without having called at least one tool.
+- Never describe a plan. Execute it.
+- If the task is to create or improve a landing page, prefer build_landing_page.
+- If the task involves creating or editing a file, use write_file or replace_in_file.
+- If the task says "open", use open_target after writing.
 
-Respond with JSON only. No markdown. No arrays."""
+Respond with JSON only. No markdown. No prose. No arrays."""
 
 MODE_GUIDANCE: dict[str, str] = {
     "companion": "Stay present and warm. Match the user's pacing. Help them think.",
@@ -348,7 +360,6 @@ MODE_GUIDANCE: dict[str, str] = {
     "brainstorm": "Be generative. Build on ideas. Stay open.",
     "reflect": "Listen closely. Summarise. Help the user see their own thinking.",
 }
-
 
 # ── Config ─────────────────────────────────────────────────
 
@@ -363,6 +374,44 @@ class Config:
     workspace_root: str | None = None
     companion_mode: str = "companion"
     history_window: int = 14
+
+
+@dataclass(frozen=True)
+class ToolkitRoute:
+    skill_name: str
+    signals: tuple[str, ...]
+    actions: tuple[str, ...] = ()
+    followup_suffixes: tuple[str, ...] = ()
+    followup_actions: tuple[str, ...] = ()
+    score: int = 10
+
+
+TOOLKIT_ROUTES: tuple[ToolkitRoute, ...] = (
+    ToolkitRoute(
+        skill_name="landing-pages",
+        signals=("landing page", "homepage", "hero section", "browser", "html", "site"),
+        actions=("create", "build", "make", "improve", "refine", "redesign", "rewrite", "wow me"),
+        followup_suffixes=(".html",),
+        followup_actions=("open", "show", "improve", "refine", "redesign", "rewrite", "second pass", "wow me"),
+        score=30,
+    ),
+    ToolkitRoute(
+        skill_name="debug",
+        signals=("debug", "bug", "error", "failing", "traceback", "stack trace", "fix this"),
+        actions=("fix", "debug", "investigate", "diagnose"),
+        followup_suffixes=(".py", ".js", ".ts", ".tsx", ".jsx"),
+        followup_actions=("fix", "debug", "why", "investigate"),
+        score=22,
+    ),
+    ToolkitRoute(
+        skill_name="web-dev",
+        signals=("css", "javascript", "frontend", "component", "layout", "responsive", "ui"),
+        actions=("build", "style", "design", "improve", "adjust", "refine"),
+        followup_suffixes=(".html", ".css", ".js"),
+        followup_actions=("style", "adjust", "improve", "refine"),
+        score=16,
+    ),
+)
 
 
 # ── The harness ────────────────────────────────────────────
@@ -389,6 +438,7 @@ class ZEROne:
 
         # Tool registry (built-in workspace tools)
         self._tools, _ = _build_workspace_tools(wroot)
+        self._register_creative_tools()
 
         # Skills: loaded from skills/ folder
         self._skills: dict[str, dict[str, Any]] = {}
@@ -402,6 +452,40 @@ class ZEROne:
         # Storage
         self._session_store = SessionStore(self.config.data_dir)
         self._memory_store = MemoryStore(self.config.data_dir / "memories.json")
+
+    def _register_creative_tools(self) -> None:
+        def _build_landing_page(
+            path: str,
+            brief: str,
+            mode: str = "create",
+            open_after: bool = True,
+        ) -> str:
+            current_html = None
+            if mode == "improve":
+                try:
+                    current_html = self._call_tool("read_file", {"path": path})
+                except Exception:
+                    current_html = None
+            html = self._generate_page_html(brief, path, current_html=current_html)
+            write_result = self._call_tool("write_file", {"path": path, "content": html})
+            opened = ""
+            if open_after:
+                opened = self._call_tool("open_target", {"target": path})
+            status = f"{mode}d landing page at {path}; {write_result}"
+            if opened:
+                status += f"; {opened}"
+            return status
+
+        self._tools.register(
+            "build_landing_page",
+            {
+                "path": "...",
+                "brief": "...",
+                "mode?": "create|improve",
+                "open_after?": True,
+            },
+            _build_landing_page,
+        )
 
     # ── Session memory compounding ────────────────────────
 
@@ -507,9 +591,9 @@ class ZEROne:
     def set_skills(self, names: list[str]) -> None:
         self._active_skills = [n for n in names if n in self._skills]
 
-    def _active_tool_names(self) -> set[str]:
+    def _tool_names_for_skills(self, skill_names: list[str] | None = None) -> set[str]:
         names: set[str] = set()
-        for sk in self._active_skills:
+        for sk in skill_names if skill_names is not None else self._active_skills:
             s = self._skills.get(sk)
             if s:
                 names.update(s["tools"])
@@ -518,13 +602,72 @@ class ZEROne:
                        "list_files", "search_text", "run_command", "open_target"})
         return names
 
-    def _skill_prompts(self) -> str:
+    def _active_tool_names(self) -> set[str]:
+        return self._tool_names_for_skills()
+
+    def _skill_prompts(self, skill_names: list[str] | None = None) -> str:
         lines: list[str] = []
-        for sk in self._active_skills:
+        for sk in skill_names if skill_names is not None else self._active_skills:
             s = self._skills.get(sk)
             if s and s.get("prompt"):
                 lines.append(f"[{s['label']}] {s['prompt']}")
         return "\n\n".join(lines)
+
+    def _toolkit_route_score(
+        self,
+        route: ToolkitRoute,
+        user_text: str,
+        session: dict[str, Any] | None = None,
+    ) -> int:
+        if route.skill_name not in self._skills:
+            return 0
+
+        lowered = user_text.lower()
+        last_target = ""
+        if session:
+            last_target = str(session.get("meta", {}).get("last_operator_target", "")).lower()
+
+        score = 0
+        if route.signals and any(signal in lowered for signal in route.signals):
+            score += route.score
+            if route.actions and any(action in lowered for action in route.actions):
+                score += 6
+
+        if (
+            last_target
+            and route.followup_suffixes
+            and any(last_target.endswith(suffix) for suffix in route.followup_suffixes)
+            and route.followup_actions
+            and any(action in lowered for action in route.followup_actions)
+        ):
+            score += route.score + 8
+
+        return score
+
+    def _rank_toolkit_routes(
+        self,
+        user_text: str,
+        session: dict[str, Any] | None = None,
+    ) -> list[tuple[str, int]]:
+        ranked: list[tuple[str, int]] = []
+        for route in TOOLKIT_ROUTES:
+            score = self._toolkit_route_score(route, user_text, session=session)
+            if score > 0:
+                ranked.append((route.skill_name, score))
+        ranked.sort(key=lambda item: (-item[1], item[0]))
+        return ranked
+
+    def _auto_skill_names(self, user_text: str, session: dict[str, Any] | None = None) -> list[str]:
+        names: list[str] = []
+        for name, _score in self._rank_toolkit_routes(user_text, session=session):
+            if name not in self._active_skills and name not in names:
+                names.append(name)
+            if len(names) >= 2:
+                break
+        return names
+
+    def _effective_skill_names(self, user_text: str, session: dict[str, Any] | None = None) -> list[str]:
+        return list(self._active_skills) + self._auto_skill_names(user_text, session=session)
 
     # ── Public API ──────────────────────────────────────
 
@@ -539,11 +682,11 @@ class ZEROne:
 
     def welcome_context(self) -> dict[str, Any]:
         return {
-            "greeting": "I'm here. What shall we work on?",
+            "greeting": "I'm here. What are we building?",
             "suggestions": (
-                "Create a landing page and open it",
-                "Improve it dramatically",
-                "What's in my workspace?",
+                "create a landing page and open it",
+                "improve it — make it better",
+                "what's in my workspace?",
             ),
         }
 
@@ -586,7 +729,7 @@ class ZEROne:
 
     # ── Prompt building ────────────────────────────────
 
-    def _build_prompt(self, user_text: str, session: dict[str, Any]) -> str:
+    def _build_prompt(self, user_text: str, session: dict[str, Any], skill_names: list[str] | None = None) -> str:
         p = self._persona
         template_path: Path = p.get("template_path", self.config.persona_path.parent / "prompt-template.txt")
         try:
@@ -614,8 +757,8 @@ class ZEROne:
         mode_guide = MODE_GUIDANCE.get(self.config.companion_mode, "I'm here to help.")
 
         # Skill prompts
-        skill_guide = self._skill_prompts()
-        tool_names = self._active_tool_names()
+        skill_guide = self._skill_prompts(skill_names)
+        tool_names = self._tool_names_for_skills(skill_names)
         tool_desc = ", ".join(sorted(tool_names)) if tool_names else ""
 
         try:
@@ -660,10 +803,24 @@ class ZEROne:
         last_target = session.get("meta", {}).get("last_operator_target", "")
         if not last_target:
             return text
-        if any(p in lowered for p in ["reopen", "re-open", "open it", "open again", "show it", "show me it"]):
+        if "show me" in lowered and any(p in lowered for p in ["workspace", "folder", "files", "what's in"]):
+            return text
+        open_phrases = (
+            "reopen", "re-open", "open it", "open again", "show it", "show me it",
+            "show me that", "show me the page", "show me the site", "show me the file",
+            "show me the second phase", "show me the improved version", "open the page",
+            "open the site", "open the file", "open the second phase", "open the improved version",
+            "show me in a browser", "open it in my browser", "open it in the browser",
+        )
+        improve_phrases = (
+            "improve it", "make it better", "second pass", "wow me", "refine it",
+            "improve that", "improve the page", "improve the site", "redo it",
+            "rewrite it", "redesign it", "take another pass", "make it feel more premium",
+        )
+        if any(p in lowered for p in open_phrases):
             return f"open {last_target}"
-        if any(p in lowered for p in ["improve it", "make it better", "second pass", "wow me", "refine it"]):
-            return f"improve {last_target}"
+        if any(p in lowered for p in improve_phrases):
+            return f"improve {last_target} and open it"
         return text
 
     def _remember_target(self, session: dict[str, Any], steps: list[dict[str, Any]]) -> None:
@@ -675,12 +832,317 @@ class ZEROne:
                 session["meta"]["last_operator_target"] = t
                 break
 
+    def _default_page_target(self) -> str:
+        preferred = self._workspace_root / "mip-framework"
+        if preferred.exists():
+            return "mip-framework/index.html"
+        return "index.html"
+
+    def _operator_target(self, task: str, session: dict[str, Any] | None = None) -> str:
+        quoted = re.findall(r"[\w./-]+\.(?:html?|css|js|md|txt)", task, flags=re.IGNORECASE)
+        if quoted:
+            return quoted[0]
+        if session:
+            last_target = str(session.get("meta", {}).get("last_operator_target", "")).strip()
+            if last_target:
+                return last_target
+        if _contains_any(task, ("landing page", "page", "site", "browser", "html")):
+            return self._default_page_target()
+        return ""
+
+    def _fallback_landing_page_html(self, name: str) -> str:
+        title = name or self.name
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{title}</title>
+  <style>
+    :root {{
+      --bg: #f4efe6;
+      --ink: #1b1a17;
+      --muted: #5b554b;
+      --panel: rgba(255, 252, 247, 0.78);
+      --line: rgba(27, 26, 23, 0.12);
+      --accent: #c46a3a;
+      --accent-2: #2f6c64;
+      --shadow: 0 24px 80px rgba(27, 26, 23, 0.12);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(196, 106, 58, 0.18), transparent 28%),
+        radial-gradient(circle at bottom right, rgba(47, 108, 100, 0.18), transparent 26%),
+        linear-gradient(180deg, #fbf6ee 0%, var(--bg) 100%);
+      min-height: 100vh;
+    }}
+    .shell {{
+      width: min(1120px, calc(100% - 40px));
+      margin: 32px auto;
+      padding: 24px;
+      border: 1px solid var(--line);
+      border-radius: 28px;
+      background: var(--panel);
+      backdrop-filter: blur(16px);
+      box-shadow: var(--shadow);
+    }}
+    .topbar {{
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      font-size: 12px;
+      color: var(--muted);
+    }}
+    .hero {{
+      padding: 72px 0 56px;
+      display: grid;
+      grid-template-columns: 1.2fr 0.8fr;
+      gap: 32px;
+      align-items: end;
+    }}
+    h1 {{
+      margin: 0;
+      font-size: clamp(3rem, 8vw, 6.4rem);
+      line-height: 0.95;
+      letter-spacing: -0.05em;
+      max-width: 8ch;
+    }}
+    .lead {{
+      max-width: 34rem;
+      font-size: 1.15rem;
+      line-height: 1.7;
+      color: var(--muted);
+      margin: 20px 0 0;
+    }}
+    .card {{
+      padding: 22px;
+      border-radius: 24px;
+      background: rgba(255, 255, 255, 0.72);
+      border: 1px solid rgba(27, 26, 23, 0.08);
+    }}
+    .pulse {{
+      width: 14px;
+      height: 14px;
+      border-radius: 999px;
+      background: var(--accent);
+      box-shadow: 0 0 0 12px rgba(196, 106, 58, 0.12);
+      margin-bottom: 18px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 18px;
+    }}
+    .grid h3 {{
+      margin: 0 0 8px;
+      font-size: 1.05rem;
+    }}
+    .grid p {{
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }}
+    .actions {{
+      display: flex;
+      gap: 14px;
+      margin-top: 28px;
+      flex-wrap: wrap;
+    }}
+    .button {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 48px;
+      padding: 0 18px;
+      border-radius: 999px;
+      text-decoration: none;
+      border: 1px solid transparent;
+      color: #fff8f2;
+      background: var(--ink);
+    }}
+    .button.alt {{
+      color: var(--ink);
+      background: transparent;
+      border-color: var(--line);
+    }}
+    @media (max-width: 820px) {{
+      .hero, .grid {{
+        grid-template-columns: 1fr;
+      }}
+      .shell {{
+        width: min(100% - 24px, 1120px);
+        padding: 18px;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <div class="topbar">
+      <span>{title}</span>
+      <span>Companion + Operator</span>
+    </div>
+    <section class="hero">
+      <div>
+        <h1>{title} builds with you.</h1>
+        <p class="lead">A companion that can think, write, edit, and act. Calm enough to stay with the work. Capable enough to move it forward.</p>
+        <div class="actions">
+          <a class="button" href="#details">See the flow</a>
+          <a class="button alt" href="#capabilities">Explore capabilities</a>
+        </div>
+      </div>
+      <aside class="card">
+        <div class="pulse"></div>
+        <strong>Designed to feel present.</strong>
+        <p class="lead">The interface stays simple while the system underneath handles memory, tools, and real execution.</p>
+      </aside>
+    </section>
+    <section id="capabilities" class="grid">
+      <article class="card">
+        <h3>Companion voice</h3>
+        <p>Warm, steady, and direct over long conversations without falling into template-sounding replies.</p>
+      </article>
+      <article class="card">
+        <h3>Operator actions</h3>
+        <p>Creates files, improves drafts, and opens the result instead of talking around the work.</p>
+      </article>
+      <article class="card">
+        <h3>Real continuity</h3>
+        <p>Remembers the last artifact so follow-up requests like “show me it” or “second pass” stay grounded.</p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>"""
+
+    def _generate_page_html(self, task: str, target: str, current_html: str | None = None) -> str:
+        system_prompt = (
+            "Return only complete HTML for a polished landing page. "
+            "No markdown fences. No explanation. "
+            "Use refined typography, layered backgrounds, strong spacing, and a premium but calm visual tone. "
+            "Keep it self-contained with inline CSS and mobile responsive."
+        )
+        if current_html:
+            user_prompt = (
+                f"Improve this existing page for the request: {task}\n"
+                f"Keep the same file target: {target}\n\n"
+                "Current HTML:\n"
+                f"{current_html}"
+            )
+        else:
+            user_prompt = (
+                f"Create a well-designed landing page for the request: {task}\n"
+                f"Use this file target as context: {target}"
+            )
+        try:
+            raw = self.provider.generate(system_prompt, [{"role": "user", "content": user_prompt}]).strip()
+        except ProviderError:
+            raw = ""
+        html = _extract_html(raw) or (raw if "<html" in raw.lower() or "<!doctype html>" in raw.lower() else "")
+        return html.strip() or self._fallback_landing_page_html(self.name)
+
+    def _execute_operator_shortcut(
+        self,
+        task: str,
+        session: dict[str, Any] | None = None,
+        skill_names: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        lowered = task.lower().strip()
+        target = self._operator_target(task, session)
+        if not target:
+            return None
+        tool_names = self._tool_names_for_skills(skill_names)
+        can_build_landing_page = "build_landing_page" in tool_names
+
+        open_only = _contains_any(lowered, (
+            "open ", "reopen", "show me", "show it", "show me it", "show me that",
+            "show me the page", "show me the second phase", "open again", "launch it",
+        )) and not _contains_any(lowered, ("create", "build", "make", "write", "improve", "refine", "rewrite", "redesign"))
+        improve = _contains_any(lowered, (
+            "improve", "second pass", "wow me", "make it better", "refine", "rewrite", "redesign", "redo",
+        ))
+        create = _contains_any(lowered, ("create", "build", "make", "write")) and _contains_any(
+            lowered, ("landing page", "page", "site", "html", "browser")
+        )
+
+        if open_only:
+            result = self._call_tool("open_target", {"target": target})
+            return {
+                "message": f"Opened {target} in the browser.",
+                "steps": [{"tool": "open_target", "args": {"target": target}, "reason": "open the current artifact", "result": result}],
+            }
+
+        if improve:
+            if can_build_landing_page:
+                result = self._call_tool(
+                    "build_landing_page",
+                    {"path": target, "brief": task, "mode": "improve", "open_after": True},
+                )
+                return {
+                    "message": f"Improved and opened {target}.",
+                    "steps": [
+                        {"tool": "build_landing_page", "args": {"path": target, "brief": task, "mode": "improve", "open_after": True}, "reason": "rewrite the page with a stronger second pass", "result": result},
+                    ],
+                }
+            try:
+                current_html = self._call_tool("read_file", {"path": target})
+            except Exception:
+                current_html = ""
+            html = self._generate_page_html(task, target, current_html=current_html)
+            write_result = self._call_tool("write_file", {"path": target, "content": html})
+            open_result = self._call_tool("open_target", {"target": target})
+            return {
+                "message": f"Improved and opened {target}.",
+                "steps": [
+                    {"tool": "write_file", "args": {"path": target, "content": html}, "reason": "rewrite the page with a stronger second pass", "result": write_result},
+                    {"tool": "open_target", "args": {"target": target}, "reason": "open the improved page", "result": open_result},
+                ],
+            }
+
+        if create:
+            if can_build_landing_page:
+                result = self._call_tool(
+                    "build_landing_page",
+                    {"path": target, "brief": task, "mode": "create", "open_after": True},
+                )
+                return {
+                    "message": f"Created and opened {target}.",
+                    "steps": [
+                        {"tool": "build_landing_page", "args": {"path": target, "brief": task, "mode": "create", "open_after": True}, "reason": "create the requested page", "result": result},
+                    ],
+                }
+            html = self._generate_page_html(task, target)
+            write_result = self._call_tool("write_file", {"path": target, "content": html})
+            open_result = self._call_tool("open_target", {"target": target})
+            return {
+                "message": f"Created and opened {target}.",
+                "steps": [
+                    {"tool": "write_file", "args": {"path": target, "content": html}, "reason": "create the requested page", "result": write_result},
+                    {"tool": "open_target", "args": {"target": target}, "reason": "open the new page", "result": open_result},
+                ],
+            }
+
+        return None
+
     # ── Agent loop ─────────────────────────────────────
 
-    def _agent_loop(self, task: str, session: dict[str, Any] | None = None, max_steps: int = 6) -> dict[str, Any]:
+    def _agent_loop(
+        self,
+        task: str,
+        session: dict[str, Any] | None = None,
+        max_steps: int = 6,
+        skill_names: list[str] | None = None,
+    ) -> dict[str, Any]:
         history: list[dict[str, str]] = []
         steps: list[dict[str, Any]] = []
-        tool_names = self._active_tool_names()
+        tool_names = self._tool_names_for_skills(skill_names)
 
         for _ in range(max_steps):
             messages: list[dict[str, str]] = [{"role": "user", "content": f"Task: {task}"}]
@@ -713,6 +1175,11 @@ class ZEROne:
                 plan["kind"] = "final" if plan.get("message") else "tool"
 
             if plan["kind"] == "final":
+                if not steps:
+                    # Model tried to finish without any tool calls — force a retry
+                    history.append({"role": "assistant", "content": json.dumps({k: v for k, v in plan.items() if k != "kind"})})
+                    history.append({"role": "user", "content": "You haven't used any tools yet. You must call a tool — describe nothing, do it."})
+                    continue
                 return {"message": str(plan.get("message", "")).strip(), "steps": steps}
 
             tool = str(plan.get("tool", "")).strip()
@@ -744,6 +1211,7 @@ class ZEROne:
     def reply(self, session_id: str, user_text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._safe_load_session(session_id)
         effective_text = self._contextualize_request(user_text, session)
+        effective_skills = self._effective_skill_names(effective_text, session=session)
 
         # Store memory for facts
         try:
@@ -775,7 +1243,7 @@ class ZEROne:
                               for m in session["messages"][-self.config.history_window:]]
 
         try:
-            draft = self.provider.generate(self._build_prompt(effective_text, session), model_messages)
+            draft = self.provider.generate(self._build_prompt(effective_text, session, skill_names=effective_skills), model_messages)
         except ProviderError as exc:
             # Save user message but return error gracefully
             assistant_msg: dict[str, Any] = {
@@ -796,16 +1264,35 @@ class ZEROne:
         if not draft_report.overall_passed:
             reply_content = draft_filtered  # use corrected version
 
-        # Agent loop for operator requests
         if self._is_operator_request(effective_text) or self._is_open_request(effective_text):
-            loop_result = self._agent_loop(effective_text, session=session)
+            loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
+            if loop_result is None:
+                loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills)
             if loop_result:
                 agent_steps = loop_result.get("steps", [])
-                if loop_result.get("message"):
-                    reply_content = loop_result["message"]
 
-                # Fallback: if model generated HTML content, write it
-                if not agent_steps and any(w in effective_text.lower() for w in ["create", "build", "make"]):
+                if agent_steps:
+                    # Model executed tools — use the result as the reply
+                    last_args = agent_steps[-1].get("args", {})
+                    tool = agent_steps[-1].get("tool", "")
+                    if tool == "open_target":
+                        target = last_args.get("target", "")
+                        reply_content = f"Opened {target} in the browser."
+                    elif tool == "build_landing_page":
+                        path = last_args.get("path", "")
+                        mode = str(last_args.get("mode", "create"))
+                        if mode == "improve":
+                            reply_content = f"Improved and opened {path}."
+                        else:
+                            reply_content = f"Created and opened {path}."
+                    elif tool == "write_file":
+                        path = last_args.get("path", "")
+                        reply_content = f"Written to {path}."
+                    else:
+                        reply_content = loop_result.get("message", "Done.")
+
+                # Fallback: extract HTML from the draft if model blathered instead of working
+                if not agent_steps:
                     html = _extract_html(draft)
                     if html:
                         try:
@@ -815,9 +1302,11 @@ class ZEROne:
                             reply_content = "Created and opened index.html in the browser."
                         except ToolError as exc:
                             agent_steps = [{"tool": "write_file", "args": {"path": "index.html"}, "result": str(exc)}]
+                    else:
+                        reply_content = loop_result.get("message", "Done.")
 
-                # Run character adapter on agent loop result too
-                if reply_content != "Operator reached step limit.":
+                # Run character adapter on agent loop result
+                if reply_content:
                     loop_filtered, loop_report = filter_response(reply_content, self._adapter, context={"query": user_text})
                     if loop_report.overall_passed:
                         reply_content = loop_filtered
@@ -827,6 +1316,7 @@ class ZEROne:
             "provider": self.provider.name,
             "mode": self.config.companion_mode,
             "active_skills": list(self._active_skills),
+            "auto_skills": [name for name in effective_skills if name not in self._active_skills],
             "consistency": consistency_score,
         }
         if agent_steps:

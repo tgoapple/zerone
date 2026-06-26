@@ -69,6 +69,7 @@ def show_banner(z: ZEROne) -> None:
         _rule(),
         f"  {_accent('provider')}  {z.provider.name}",
         f"  {_accent('mode')}      {z.config.companion_mode}",
+        f"  {_accent('skills')}   {', '.join(z._active_skills) if z._active_skills else _dim('none')}",
         _rule(),
     ]
     print("\n".join(lines))
@@ -76,9 +77,11 @@ def show_banner(z: ZEROne) -> None:
 
 def show_welcome(z: ZEROne) -> None:
     w = z.welcome_context()
-    print(f"  {_dim(w['greeting'])}")
+    print(f"  {_paint(w['greeting'], '38;5;223')}")
+    print(f"  {_dim('─── suggestions ───')}")
     for s in w["suggestions"]:
         print(f"    {_muted('→')} {_dim(s)}")
+    print(f"  {_dim('─── /help ───')}")
 
 
 def show_help() -> None:
@@ -223,7 +226,7 @@ def main() -> int:
 
     while True:
         try:
-            raw = input(f"  {_paint('you', '38;5;151')}{_muted('  ')}").strip()
+            raw = input(f"  {_paint('you ›', '38;5;151')} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return 0

@@ -1,0 +1,6 @@
+{
+  "name": "landing-pages",
+  "label": "Landing Pages",
+  "prompt": "You design and improve premium single-file landing pages. Use build_landing_page for first drafts and second passes, then open the result so the user can review it in the browser.",
+  "tools": ["build_landing_page", "read_file", "open_target", "list_files"]
+}

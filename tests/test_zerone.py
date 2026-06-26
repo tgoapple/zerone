@@ -229,8 +229,12 @@ class TestZEROneCore:
         assert "index.html" in result
         result2 = z._contextualize_request("improve it", session)
         assert "index.html" in result2
-        result3 = z._contextualize_request("hello", session)
-        assert result3 == "hello"
+        result3 = z._contextualize_request("show me the second phase in a browser", session)
+        assert result3 == "open index.html"
+        result4 = z._contextualize_request("show me the workspace", session)
+        assert result4 == "show me the workspace"
+        result5 = z._contextualize_request("hello", session)
+        assert result5 == "hello"
 
     def test_safe_load_session(self, z):
         session = z._safe_load_session("test-load")
@@ -248,6 +252,72 @@ class TestZEROneCore:
         assert _strip_fences("```json\n{\"key\": \"value\"}\n```") == '{"key": "value"}'
         assert _strip_fences("plain text") == "plain text"
 
+    def test_operator_shortcut_create_page(self, z, monkeypatch):
+        calls = []
+
+        def fake_call_tool(name, args):
+            calls.append((name, args))
+            if name == "build_landing_page":
+                return f"created landing page at {args['path']}"
+            return ""
+
+        monkeypatch.setattr(z, "_call_tool", fake_call_tool)
+
+        result = z._execute_operator_shortcut(
+            "create a landing page and open it",
+            skill_names=["landing-pages"],
+        )
+
+        assert result is not None
+        assert result["message"] == "Created and opened mip-framework/index.html."
+        assert calls == [(
+            "build_landing_page",
+            {"path": "mip-framework/index.html", "brief": "create a landing page and open it", "mode": "create", "open_after": True},
+        )]
+
+    def test_operator_shortcut_improve_last_target(self, z, monkeypatch):
+        calls = []
+
+        def fake_call_tool(name, args):
+            calls.append((name, args))
+            if name == "build_landing_page":
+                return f"improved landing page at {args['path']}"
+            return ""
+
+        monkeypatch.setattr(z, "_call_tool", fake_call_tool)
+        session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}
+
+        result = z._execute_operator_shortcut(
+            "now improve it, do a second pass and wow me",
+            session=session,
+            skill_names=["landing-pages"],
+        )
+
+        assert result is not None
+        assert result["message"] == "Improved and opened mip-framework/index.html."
+        assert calls == [(
+            "build_landing_page",
+            {"path": "mip-framework/index.html", "brief": "now improve it, do a second pass and wow me", "mode": "improve", "open_after": True},
+        )]
+
+    def test_operator_shortcut_open_last_target(self, z, monkeypatch):
+        calls = []
+
+        def fake_call_tool(name, args):
+            calls.append((name, args))
+            if name == "open_target":
+                return f"Opened {args['target']}"
+            return ""
+
+        monkeypatch.setattr(z, "_call_tool", fake_call_tool)
+        session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}
+
+        result = z._execute_operator_shortcut("show me the second phase in a browser", session=session)
+
+        assert result is not None
+        assert result["message"] == "Opened mip-framework/index.html in the browser."
+        assert calls == [("open_target", {"target": "mip-framework/index.html"})]
+
 
 # ── Skills ──────────────────────────────────────────────────
 
@@ -259,6 +329,7 @@ class TestSkills:
         names = [s["name"] for s in skills]
         assert "web-dev" in names
         assert "debug" in names
+        assert "landing-pages" in names
 
     def test_activate_deactivate(self, z):
         assert z.activate_skill("web-dev") is True
@@ -282,6 +353,41 @@ class TestSkills:
         names = z._active_tool_names()
         assert "read_file" in names  # always included
         assert "write_file" in names
+        assert "build_landing_page" not in names
+
+    def test_landing_pages_skill_adds_tool(self, z):
+        z.set_skills(["landing-pages"])
+        names = z._active_tool_names()
+        assert "build_landing_page" in names
+
+    def test_auto_skill_names_for_landing_page(self, z):
+        session = {"id": "test", "messages": [], "meta": {}}
+        names = z._auto_skill_names("create a well designed landing page and open it", session=session)
+        assert "landing-pages" in names
+        assert "landing-pages" not in z._active_skills
+
+    def test_rank_toolkit_routes_prefers_landing_pages(self, z):
+        session = {"id": "test", "messages": [], "meta": {}}
+        ranked = z._rank_toolkit_routes("create a responsive landing page in html", session=session)
+        assert ranked[0][0] == "landing-pages"
+        assert any(name == "web-dev" for name, _score in ranked)
+
+    def test_auto_skill_names_caps_at_two(self, z):
+        session = {"id": "test", "messages": [], "meta": {"last_operator_target": "index.html"}}
+        names = z._auto_skill_names("improve the html landing page layout and debug it", session=session)
+        assert len(names) <= 2
+
+    def test_effective_skills_include_manual_and_auto(self, z):
+        z.set_skills(["web-dev"])
+        session = {"id": "test", "messages": [], "meta": {}}
+        names = z._effective_skill_names("create a landing page in html", session=session)
+        assert "web-dev" in names
+        assert "landing-pages" in names
+
+    def test_html_followup_auto_selects_landing_pages(self, z):
+        session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}
+        names = z._auto_skill_names("show me the second phase in a browser", session=session)
+        assert names[0] == "landing-pages"
 
     def test_reload_skills(self, z):
         z.reload_skills()
