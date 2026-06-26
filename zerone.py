@@ -49,6 +49,29 @@ def _contains_any(text: str, phrases: tuple[str, ...]) -> bool:
     return any(phrase in lowered for phrase in phrases)
 
 
+def _extract_dsml_tool_calls(text: str) -> list[dict[str, Any]]:
+    calls: list[dict[str, Any]] = []
+    invoke_pattern = re.compile(
+        r"<｜｜DSML｜｜invoke name=\"([^\"]+)\">(.*?)</｜｜DSML｜｜invoke>",
+        re.DOTALL,
+    )
+    param_pattern = re.compile(
+        r"<｜｜DSML｜｜parameter name=\"([^\"]+)\"(?:\s+string=\"true\")?>(.*?)</｜｜DSML｜｜parameter>",
+        re.DOTALL,
+    )
+    for match in invoke_pattern.finditer(text):
+        name = match.group(1).strip()
+        block = match.group(2)
+        args: dict[str, Any] = {}
+        for p_match in param_pattern.finditer(block):
+            key = p_match.group(1).strip()
+            value = p_match.group(2).strip()
+            args[key] = value
+        if name:
+            calls.append({"tool": name, "args": args})
+    return calls
+
+
 # ── Session / Memory stores ────────────────────────────────
 
 class SessionStore:
@@ -350,6 +373,7 @@ Rules:
 - If the task is to create or improve a landing page, prefer build_landing_page.
 - If the task involves creating or editing a file, use write_file or replace_in_file.
 - If the task says "open", use open_target after writing.
+- Never emit DSML, XML-like tool markup, or pseudo function-calling syntax.
 
 Respond with JSON only. No markdown. No prose. No arrays."""
 
@@ -1206,6 +1230,44 @@ class ZEROne:
         except TypeError as exc:
             return f"Arg error: {exc}"
 
+    def _normalize_tool_args(self, tool_name: str, args: dict[str, Any], session: dict[str, Any] | None = None) -> dict[str, Any]:
+        normalized = dict(args)
+        if tool_name == "open_target":
+            if "target" not in normalized and "path" in normalized:
+                normalized["target"] = normalized.pop("path")
+        if tool_name == "build_landing_page":
+            if "path" not in normalized:
+                normalized["path"] = self._operator_target("landing page", session=session) or self._default_page_target()
+            if "brief" not in normalized:
+                title = str(normalized.get("title", "")).strip()
+                tagline = str(normalized.get("tagline", "")).strip()
+                parts = [p for p in [title, tagline] if p]
+                normalized["brief"] = " | ".join(parts) if parts else "Create a premium landing page."
+            if "mode" not in normalized:
+                normalized["mode"] = "create"
+            if "open_after" not in normalized:
+                normalized["open_after"] = True
+            normalized.pop("title", None)
+            normalized.pop("tagline", None)
+        return normalized
+
+    def _execute_dsml_tool_calls(self, text: str, session: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        steps: list[dict[str, Any]] = []
+        for call in _extract_dsml_tool_calls(text):
+            tool_name = call.get("tool", "")
+            raw_args = call.get("args", {}) or {}
+            if not isinstance(raw_args, dict):
+                raw_args = {}
+            args = self._normalize_tool_args(tool_name, raw_args, session=session)
+            result = self._call_tool(tool_name, args)
+            steps.append({
+                "tool": tool_name,
+                "args": args,
+                "reason": "execute provider-emitted tool call",
+                "result": result,
+            })
+        return steps
+
     # ── Main reply ─────────────────────────────────────
 
     def reply(self, session_id: str, user_text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -1257,6 +1319,7 @@ class ZEROne:
 
         reply_content = draft
         agent_steps: list[dict[str, Any]] = []
+        dsml_steps = self._execute_dsml_tool_calls(draft, session=session) if "<｜｜DSML｜｜" in draft else []
 
         # Run character adapter on the draft
         draft_filtered, draft_report = filter_response(draft, self._adapter, context={"query": user_text})
@@ -1265,9 +1328,13 @@ class ZEROne:
             reply_content = draft_filtered  # use corrected version
 
         if self._is_operator_request(effective_text) or self._is_open_request(effective_text):
-            loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
-            if loop_result is None:
-                loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills)
+            loop_result: dict[str, Any] | None = None
+            if dsml_steps:
+                loop_result = {"message": "Executed tool actions.", "steps": dsml_steps}
+            else:
+                loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
+                if loop_result is None:
+                    loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills)
             if loop_result:
                 agent_steps = loop_result.get("steps", [])
 

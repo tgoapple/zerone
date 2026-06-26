@@ -252,6 +252,31 @@ class TestZEROneCore:
         assert _strip_fences("```json\n{\"key\": \"value\"}\n```") == '{"key": "value"}'
         assert _strip_fences("plain text") == "plain text"
 
+    def test_extract_dsml_tool_calls(self):
+        from zerone import _extract_dsml_tool_calls
+        text = """
+<｜｜DSML｜｜tool_calls>
+<｜｜DSML｜｜invoke name="open_target">
+<｜｜DSML｜｜parameter name="path" string="true">mip-framework/index.html</｜｜DSML｜｜parameter>
+</｜｜DSML｜｜invoke>
+</｜｜DSML｜｜tool_calls>
+"""
+        calls = _extract_dsml_tool_calls(text)
+        assert calls == [{"tool": "open_target", "args": {"path": "mip-framework/index.html"}}]
+
+    def test_normalize_dsml_tool_args(self, z):
+        session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}
+        open_args = z._normalize_tool_args("open_target", {"path": "mip-framework/index.html"}, session=session)
+        assert open_args == {"target": "mip-framework/index.html"}
+        build_args = z._normalize_tool_args(
+            "build_landing_page",
+            {"title": "MIP Framework", "tagline": "Mindful. Intentional. Precise."},
+            session=session,
+        )
+        assert build_args["path"] == "mip-framework/index.html"
+        assert "MIP Framework" in build_args["brief"]
+        assert build_args["open_after"] is True
+
     def test_operator_shortcut_create_page(self, z, monkeypatch):
         calls = []
 
