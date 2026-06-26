@@ -442,7 +442,7 @@ class TestSkills:
         session = {"id": "test", "messages": [], "meta": {}}
         names = z._effective_skill_names("create a landing page in html", session=session)
         assert "web-dev" in names
-        assert "landing-pages" in names
+        assert "landing-pages" not in names
 
     def test_html_followup_auto_selects_landing_pages(self, z):
         session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}

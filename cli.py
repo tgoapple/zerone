@@ -69,7 +69,6 @@ def show_banner(z: ZEROne) -> None:
         _rule(),
         f"  {_accent('provider')}  {z.provider.name}",
         f"  {_accent('mode')}      {z.config.companion_mode}",
-        f"  {_accent('skills')}   {', '.join(z._active_skills) if z._active_skills else _dim('none')}",
         _rule(),
     ]
     print("\n".join(lines))
@@ -93,13 +92,6 @@ def show_help() -> None:
         ("/provider", "switch provider"),
         ("/model", "switch model"),
         ("/mode", "switch companion mode"),
-        ("/skills", "list active skills"),
-        ("/skill +<name>", "activate a skill"),
-        ("/skill -<name>", "deactivate a skill"),
-        ("/memories", "list memories"),
-        ("/remember", "save a fact"),
-        ("/forget", "remove a memory"),
-        ("/sessions", "list sessions"),
         ("/session <name>", "switch session"),
         ("/new", "new session"),
         ("/exit", "quit"),
@@ -115,8 +107,6 @@ def show_status(z: ZEROne, session_id: str) -> None:
     print(f"  {_accent('provider')}  {s['provider']} / {s['model']}")
     print(f"  {_accent('mode')}      {s['mode']}")
     print(f"  {_accent('session')}   {s['session_id']}  ({s['messages']} turns)")
-    if s['skills']:
-        print(f"  {_accent('skills')}   {', '.join(s['skills'])}")
     if s['summary']:
         print(f"  {_accent('summary')}  {s['summary'][:80]}")
     print(_rule())

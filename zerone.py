@@ -627,8 +627,7 @@ class ZEROne:
             if s:
                 names.update(s["tools"])
         # Always include core tools
-        names.update({"read_file", "write_file", "replace_in_file", "insert_in_file",
-                       "list_files", "search_text", "run_command", "open_target"})
+        names.update({"read_file", "write_file", "replace_in_file", "open_target"})
         return names
 
     def _active_tool_names(self) -> set[str]:
@@ -696,7 +695,7 @@ class ZEROne:
         return names
 
     def _effective_skill_names(self, user_text: str, session: dict[str, Any] | None = None) -> list[str]:
-        return list(self._active_skills) + self._auto_skill_names(user_text, session=session)
+        return list(self._active_skills)
 
     # ── Public API ──────────────────────────────────────
 
@@ -1088,8 +1087,7 @@ class ZEROne:
         target = self._operator_target(task, session)
         if not target:
             return None
-        tool_names = self._tool_names_for_skills(skill_names)
-        can_build_landing_page = "build_landing_page" in tool_names
+        is_page_task = _contains_any(lowered, ("landing page", "page", "site", "html", "browser")) or target.lower().endswith(".html")
 
         open_only = _contains_any(lowered, (
             "open ", "reopen", "show me", "show it", "show me it", "show me that",
@@ -1111,7 +1109,7 @@ class ZEROne:
             }
 
         if improve:
-            if can_build_landing_page:
+            if is_page_task:
                 result = self._call_tool(
                     "build_landing_page",
                     {"path": target, "brief": task, "mode": "improve", "open_after": True},
@@ -1138,7 +1136,7 @@ class ZEROne:
             }
 
         if create:
-            if can_build_landing_page:
+            if is_page_task:
                 result = self._call_tool(
                     "build_landing_page",
                     {"path": target, "brief": task, "mode": "create", "open_after": True},
@@ -1312,6 +1310,60 @@ class ZEROne:
             session.setdefault("meta", {})["overflow_trimmed"] = len(overflow)
             model_messages = [{"role": m["role"], "content": m["content"]}
                               for m in session["messages"][-self.config.history_window:]]
+
+        # Fast path: deterministic operator actions should run before the model.
+        if self._is_operator_request(effective_text) or self._is_open_request(effective_text):
+            direct_result = self._execute_operator_shortcut(
+                effective_text,
+                session=session,
+                skill_names=effective_skills,
+            )
+            if direct_result and direct_result.get("steps"):
+                agent_steps = direct_result.get("steps", [])
+                last_step = agent_steps[-1] if agent_steps else {}
+                last_args = last_step.get("args", {}) or {}
+                last_tool = str(last_step.get("tool", ""))
+                last_result = str(last_step.get("result", ""))
+
+                if _tool_result_failed(last_result):
+                    reply_content = last_result
+                elif last_tool == "open_target":
+                    reply_content = f"Opened {last_args.get('target', '')} in the browser."
+                elif last_tool == "build_landing_page":
+                    path = last_args.get("path", "")
+                    mode = str(last_args.get("mode", "create"))
+                    reply_content = f"Improved and opened {path}." if mode == "improve" else f"Created and opened {path}."
+                elif last_tool == "write_file":
+                    reply_content = f"Written to {last_args.get('path', '')}."
+                else:
+                    reply_content = str(direct_result.get("message", "Done.")).strip() or "Done."
+
+                loop_filtered, loop_report = filter_response(reply_content, self._adapter, context={"query": user_text})
+                if loop_report.overall_passed:
+                    reply_content = loop_filtered
+                consistency_score = round(loop_report.overall_score, 3)
+
+                meta: dict[str, Any] = {
+                    "provider": self.provider.name,
+                    "mode": self.config.companion_mode,
+                    "active_skills": list(self._active_skills),
+                    "auto_skills": [name for name in effective_skills if name not in self._active_skills],
+                    "consistency": consistency_score,
+                    "agent_steps": agent_steps,
+                }
+                assistant_msg: dict[str, Any] = {
+                    "id": str(uuid.uuid4()),
+                    "role": "assistant",
+                    "content": reply_content,
+                    "created_at": utc_now(),
+                    "meta": meta,
+                }
+                session["messages"].append(assistant_msg)
+                self._remember_target(session, agent_steps)
+                self._update_meta(session, user_text)
+                self._store_session_memory_if_due(session)
+                self._session_store.save(session)
+                return assistant_msg
 
         try:
             draft = self.provider.generate(self._build_prompt(effective_text, session, skill_names=effective_skills), model_messages)
