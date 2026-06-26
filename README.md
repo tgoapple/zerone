@@ -23,14 +23,35 @@ python3 cli.py
 # Run with a specific provider and model
 python3 cli.py --provider openai --model gpt-4o-mini
 python3 cli.py --provider ollama --model qwen2.5:7b
-python3 cli.py --provider deepseek --model deepseek-chat
+python3 cli.py --provider deepseek --model deepseek-v4-flash
 
 # One-shot reply and exit
 python3 cli.py --one-shot "Who are you?"
 
 # Custom session
 python3 cli.py --session my-project
+
+# Telegram bridge
+export TELEGRAM_BOT_TOKEN=123456:abc...
+./launch-telegram.sh
 ```
+
+## Telegram
+
+ZEROne can also run as a lean Telegram surface using the same runtime as the CLI.
+
+```bash
+export TELEGRAM_BOT_TOKEN=123456:abc...
+export DEEPSEEK_API_KEY=sk-...
+./launch-telegram.sh
+```
+
+What it does:
+
+- Uses the same ZEROne core, memory, and workspace tools as the CLI
+- Shows Telegram typing presence while ZEROne is working
+- Splits long replies safely so Telegram does not truncate them
+- Supports `/help` and `/status`
 
 ## Commands
 
