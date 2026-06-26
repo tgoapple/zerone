@@ -1,0 +1,6 @@
+{
+  "name": "debug",
+  "label": "Debugging",
+  "prompt": "You help find and fix bugs. Read files first, understand the issue, then make minimal targeted changes. Verify after each edit.",
+  "tools": ["read_file", "search_text", "replace_in_file", "run_command", "list_files"]
+}

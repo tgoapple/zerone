@@ -1,0 +1,6 @@
+{
+  "name": "web-dev",
+  "label": "Web Development",
+  "prompt": "You build single-file HTML pages. Prefer clean, minimal design. After writing, open the file so the user can see it.",
+  "tools": ["write_file", "read_file", "replace_in_file", "open_target", "list_files"]
+}

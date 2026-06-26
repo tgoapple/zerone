@@ -1,0 +1,56 @@
+"""Tests for ZEROne providers."""
+import os
+from unittest.mock import patch
+
+import pytest
+
+from providers import (
+    OpenAIProvider, DeepSeekProvider, OllamaProvider,
+    build_provider, ProviderError,
+)
+
+
+class TestBuildProvider:
+    def test_build_openai(self):
+        p = build_provider("openai")
+        assert isinstance(p, OpenAIProvider)
+
+    def test_build_deepseek(self):
+        p = build_provider("deepseek")
+        assert isinstance(p, DeepSeekProvider)
+
+    def test_build_ollama(self):
+        p = build_provider("ollama")
+        assert isinstance(p, OllamaProvider)
+
+    def test_build_unknown(self):
+        with pytest.raises(ProviderError):
+            build_provider("nonexistent")
+
+    def test_build_models(self):
+        p = build_provider("openai", "gpt-4")
+        assert p.model == "gpt-4"
+
+
+class TestProviderErrors:
+    def test_openai_no_key(self):
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}):
+            p = OpenAIProvider()
+            with pytest.raises(ProviderError, match="not configured"):
+                p.generate("prompt", [{"role": "user", "content": "hi"}])
+
+    def test_deepseek_no_key(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": ""}):
+            p = DeepSeekProvider()
+            with pytest.raises(ProviderError, match="not configured"):
+                p.generate("prompt", [{"role": "user", "content": "hi"}])
+
+    def test_ollama_local(self):
+        """Ollama doesn't require a key, but will fail locally."""
+        p = OllamaProvider(base_url="http://localhost:99999")
+        with pytest.raises(ProviderError):
+            p.generate("prompt", [{"role": "user", "content": "hi"}])
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
