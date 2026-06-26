@@ -302,10 +302,24 @@ def _build_workspace_tools(root: Path) -> tuple[Registry, dict[str, str]]:
 
     def _open(target: str) -> str:
         import subprocess
-        resolved = _resolve(target)
-        uri = str(resolved) if resolved.exists() else target
-        subprocess.run(["open", uri], check=True, timeout=5)
-        return f"Opened {uri}"
+        cleaned = str(target).strip()
+        try:
+            resolved = _resolve(cleaned)
+            uri = str(resolved)
+            subprocess.run(["open", uri], check=True, timeout=5)
+            return f"Opened {uri}"
+        except ToolError:
+            looks_like_app = cleaned.endswith(".app") or ("/" not in cleaned and "." not in cleaned)
+            if looks_like_app:
+                subprocess.run(["open", "-a", cleaned], check=True, timeout=5)
+                return f"Opened application {cleaned}"
+            raw = Path(cleaned).expanduser()
+            if raw.exists():
+                uri = str(raw.resolve())
+                subprocess.run(["open", uri], check=True, timeout=5)
+                return f"Opened {uri}"
+            subprocess.run(["open", cleaned], check=True, timeout=5)
+            return f"Opened {cleaned}"
 
     # Register tools
     reg.register("read_file", {"path": "...", "start?": 1, "end?": 50}, _read)

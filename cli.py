@@ -159,15 +159,29 @@ def show_history(z: ZEROne, session_id: str) -> None:
 
 
 def _thinking(stop: threading.Event, status_text: str) -> None:
-    frames = ["  ", "· ", "··", "···"]
+    frames = ["", ".", "..", "..."]
     i = 0
     while not stop.is_set():
-        sys.stdout.write(f"\r  {_paint(frames[i % 4], '38;5;240')} {_dim(status_text)}")
+        dots = frames[i % len(frames)]
+        sys.stdout.write(f"\r  {_dim(status_text)}{_paint(dots, '38;5;240')}")
         sys.stdout.flush()
         i += 1
-        stop.wait(0.25)
+        stop.wait(0.35)
     sys.stdout.write("\r" + " " * (len(status_text) + 8) + "\r")
     sys.stdout.flush()
+
+
+def _typewrite(text: str, delay: float = 0.008) -> None:
+    if not text:
+        print()
+        return
+    for ch in text:
+        sys.stdout.write(ch)
+        sys.stdout.flush()
+        if ch not in ("\n", "\r"):
+            time.sleep(delay)
+    if not text.endswith("\n"):
+        print()
 
 
 def reply_and_show(z: ZEROne, session_id: str, text: str) -> None:
@@ -190,7 +204,9 @@ def reply_and_show(z: ZEROne, session_id: str, text: str) -> None:
             result = (s.get("result") or "")[:70]
             print(f"    {_dim(tool)}  {_muted(result)}")
 
-    print(f"  {_label(z.name)}  {content}")
+    sys.stdout.write(f"  {_label(z.name)}  ")
+    sys.stdout.flush()
+    _typewrite(content)
     print()
 
 

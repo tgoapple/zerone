@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import tempfile
+from unittest.mock import patch
 from pathlib import Path
 
 import pytest
@@ -162,6 +163,29 @@ class TestToolError:
         e = ToolError("something broke")
         assert str(e) == "something broke"
         assert isinstance(e, RuntimeError)
+
+
+class TestOpenTarget:
+    def test_open_target_opens_workspace_file(self, tmp_dir):
+        from zerone import _build_workspace_tools
+        (tmp_dir / "index.html").write_text("<h1>Hello</h1>")
+        reg, _ = _build_workspace_tools(tmp_dir)
+        tool = reg.get("open_target")
+        assert tool is not None
+        with patch("subprocess.run") as run:
+            result = tool["handler"]("index.html")
+        run.assert_called_once()
+        assert "Opened" in result
+
+    def test_open_target_opens_application_name(self, tmp_dir):
+        from zerone import _build_workspace_tools
+        reg, _ = _build_workspace_tools(tmp_dir)
+        tool = reg.get("open_target")
+        assert tool is not None
+        with patch("subprocess.run") as run:
+            result = tool["handler"]("Terminal")
+        run.assert_called_once_with(["open", "-a", "Terminal"], check=True, timeout=5)
+        assert result == "Opened application Terminal"
 
 
 # ── ZEROne ──────────────────────────────────────────────────
