@@ -276,6 +276,19 @@ class TestZEROneCore:
         assert build_args["path"] == "mip-framework/index.html"
         assert "MIP Framework" in build_args["brief"]
         assert build_args["open_after"] is True
+        build_args2 = z._normalize_tool_args(
+            "build_landing_page",
+            {"title": "MIP Framework", "open_after": "true"},
+            session=session,
+        )
+        assert build_args2["open_after"] is True
+
+    def test_tool_result_failed(self):
+        from zerone import _tool_result_failed
+        assert _tool_result_failed("Arg error: bad args") is True
+        assert _tool_result_failed("Tool error: bad path") is True
+        assert _tool_result_failed("Unknown tool: nope") is True
+        assert _tool_result_failed("wrote 10 lines") is False
 
     def test_operator_shortcut_create_page(self, z, monkeypatch):
         calls = []
@@ -324,6 +337,28 @@ class TestZEROneCore:
             "build_landing_page",
             {"path": "mip-framework/index.html", "brief": "now improve it, do a second pass and wow me", "mode": "improve", "open_after": True},
         )]
+
+    def test_operator_shortcut_take_another_pass(self, z, monkeypatch):
+        calls = []
+
+        def fake_call_tool(name, args):
+            calls.append((name, args))
+            if name == "build_landing_page":
+                return f"improved landing page at {args['path']}"
+            return ""
+
+        monkeypatch.setattr(z, "_call_tool", fake_call_tool)
+        session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}
+
+        result = z._execute_operator_shortcut(
+            "its better but still needs work on the design front, take another pass",
+            session=session,
+            skill_names=["landing-pages"],
+        )
+
+        assert result is not None
+        assert result["message"] == "Improved and opened mip-framework/index.html."
+        assert calls[0][0] == "build_landing_page"
 
     def test_operator_shortcut_open_last_target(self, z, monkeypatch):
         calls = []

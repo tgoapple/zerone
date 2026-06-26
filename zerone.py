@@ -72,6 +72,11 @@ def _extract_dsml_tool_calls(text: str) -> list[dict[str, Any]]:
     return calls
 
 
+def _tool_result_failed(result: str) -> bool:
+    lowered = (result or "").lower()
+    return lowered.startswith("arg error:") or lowered.startswith("tool error:") or lowered.startswith("unknown tool:")
+
+
 # ── Session / Memory stores ────────────────────────────────
 
 class SessionStore:
@@ -811,7 +816,7 @@ class ZEROne:
     def _is_operator_request(self, text: str) -> bool:
         lowered = text.lower()
         actions = ("create", "build", "make", "write", "edit", "update", "open", "launch",
-                   "fix", "change", "improve", "rewrite", "redesign", "refine", "redo")
+                   "fix", "change", "improve", "rewrite", "redesign", "refine", "redo", "pass")
         targets = ("file", "page", "landing page", "html", "browser", "folder", "readme",
                    "index", "workspace", "site", "it")
         return any(a in lowered for a in actions) and any(t in lowered for t in targets)
@@ -839,7 +844,8 @@ class ZEROne:
         improve_phrases = (
             "improve it", "make it better", "second pass", "wow me", "refine it",
             "improve that", "improve the page", "improve the site", "redo it",
-            "rewrite it", "redesign it", "take another pass", "make it feel more premium",
+            "rewrite it", "redesign it", "take another pass", "another pass", "one more pass",
+            "pass again", "make it feel more premium",
         )
         if any(p in lowered for p in open_phrases):
             return f"open {last_target}"
@@ -1091,6 +1097,7 @@ class ZEROne:
         )) and not _contains_any(lowered, ("create", "build", "make", "write", "improve", "refine", "rewrite", "redesign"))
         improve = _contains_any(lowered, (
             "improve", "second pass", "wow me", "make it better", "refine", "rewrite", "redesign", "redo",
+            "take another pass", "another pass", "one more pass", "pass again",
         ))
         create = _contains_any(lowered, ("create", "build", "make", "write")) and _contains_any(
             lowered, ("landing page", "page", "site", "html", "browser")
@@ -1247,6 +1254,8 @@ class ZEROne:
                 normalized["mode"] = "create"
             if "open_after" not in normalized:
                 normalized["open_after"] = True
+            elif isinstance(normalized["open_after"], str):
+                normalized["open_after"] = normalized["open_after"].strip().lower() in ("1", "true", "yes", "y", "on")
             normalized.pop("title", None)
             normalized.pop("tagline", None)
         return normalized
@@ -1330,7 +1339,13 @@ class ZEROne:
         if self._is_operator_request(effective_text) or self._is_open_request(effective_text):
             loop_result: dict[str, Any] | None = None
             if dsml_steps:
-                loop_result = {"message": "Executed tool actions.", "steps": dsml_steps}
+                only_reads = all(step.get("tool") in {"read_file", "list_files", "search_text"} for step in dsml_steps)
+                if only_reads and _contains_any(effective_text.lower(), ("improve", "refine", "redesign", "rewrite", "another pass", "premium", "better")):
+                    loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
+                    if loop_result is None:
+                        loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills)
+                else:
+                    loop_result = {"message": "Executed tool actions.", "steps": dsml_steps}
             else:
                 loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
                 if loop_result is None:
@@ -1342,7 +1357,10 @@ class ZEROne:
                     # Model executed tools — use the result as the reply
                     last_args = agent_steps[-1].get("args", {})
                     tool = agent_steps[-1].get("tool", "")
-                    if tool == "open_target":
+                    result_text = str(agent_steps[-1].get("result", ""))
+                    if _tool_result_failed(result_text):
+                        reply_content = result_text
+                    elif tool == "open_target":
                         target = last_args.get("target", "")
                         reply_content = f"Opened {target} in the browser."
                     elif tool == "build_landing_page":

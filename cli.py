@@ -168,21 +168,22 @@ def show_history(z: ZEROne, session_id: str) -> None:
     print(_rule())
 
 
-def _thinking(stop: threading.Event) -> None:
+def _thinking(stop: threading.Event, status_text: str) -> None:
     frames = ["  ", "· ", "··", "···"]
     i = 0
     while not stop.is_set():
-        sys.stdout.write(f"\r  {_paint(frames[i % 4], '38;5;240')} {_dim('thinking')}")
+        sys.stdout.write(f"\r  {_paint(frames[i % 4], '38;5;240')} {_dim(status_text)}")
         sys.stdout.flush()
         i += 1
         stop.wait(0.25)
-    sys.stdout.write("\r" + " " * 30 + "\r")
+    sys.stdout.write("\r" + " " * (len(status_text) + 8) + "\r")
     sys.stdout.flush()
 
 
 def reply_and_show(z: ZEROne, session_id: str, text: str) -> None:
+    status_text = f"{z.name} is working" if (z._is_operator_request(text) or z._is_open_request(text)) else f"{z.name} is thinking"
     stop = threading.Event()
-    t = threading.Thread(target=_thinking, args=(stop,), daemon=True)
+    t = threading.Thread(target=_thinking, args=(stop, status_text), daemon=True)
     t.start()
     reply = z.reply(session_id, text, metadata={"surface": "cli"})
 
