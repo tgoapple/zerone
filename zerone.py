@@ -1852,7 +1852,15 @@ class ZEROne:
             for h in history:
                 messages.append(h)
             schemas = self._tools.schemas_block(tool_names)
-            prompt = SKILL_AGENT_PROMPT.replace("{tool_schemas}", schemas)
+            # Inject skill guidance into prompt
+            skill_guidance = ""
+            for sn in (skill_names or []):
+                s = self._skills.get(sn)
+                if s and s.get("prompt"):
+                    skill_guidance += f"[skill: {s['label']}] {s['prompt']}\n"
+            if skill_guidance:
+                skill_guidance = "\nActive skills:\n" + skill_guidance
+            prompt = SKILL_AGENT_PROMPT.replace("{tool_schemas}", schemas) + skill_guidance
 
             try:
                 raw = active_provider.generate(prompt, messages)
