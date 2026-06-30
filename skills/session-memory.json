@@ -1,0 +1,6 @@
+{
+  "name": "session-memory",
+  "label": "Session Memory",
+  "prompt": "You maintain persistent memory between sessions. At session start, recall past context. Every 5 turns, store a memory summary. Use session history to provide continuity across conversations.",
+  "tools": ["read_file", "write_file"]
+}

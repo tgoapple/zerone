@@ -5,11 +5,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib import error, parse, request as urllib_request
 
 from providers import BaseProvider, ProviderError, build_provider
 
@@ -75,6 +77,57 @@ def _extract_dsml_tool_calls(text: str) -> list[dict[str, Any]]:
 def _tool_result_failed(result: str) -> bool:
     lowered = (result or "").lower()
     return lowered.startswith("arg error:") or lowered.startswith("tool error:") or lowered.startswith("unknown tool:")
+
+
+def _looks_like_code_dump(text: str) -> bool:
+    if not text:
+        return False
+    if _extract_html(text) is not None:
+        return True
+    return bool(re.search(r"```(?:html|css|js|javascript|json|python)?", text, re.IGNORECASE))
+
+
+def _clean_visual_query(text: str) -> str:
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9-]+", text.lower())
+    stopwords = {
+        "create", "build", "make", "write", "improve", "redesign", "refine", "rewrite",
+        "landing", "page", "site", "browser", "html", "with", "from", "into", "that",
+        "this", "your", "their", "there", "please", "need", "want", "good", "better",
+        "premium", "design", "hero", "section", "background", "brand", "style", "look",
+        "feel", "using", "about", "calm", "nice",
+    }
+    kept: list[str] = []
+    for word in words:
+        if word in stopwords or len(word) < 3:
+            continue
+        kept.append(word)
+        if len(kept) >= 6:
+            break
+    return " ".join(kept)
+
+
+def _strip_html_tags(text: str) -> str:
+    cleaned = re.sub(r"<[^>]+>", " ", text)
+    cleaned = cleaned.replace("&amp;", "&").replace("&quot;", '"').replace("&#39;", "'")
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    return cleaned.strip()
+
+
+def _extract_url(text: str) -> str | None:
+    match = re.search(r"https?://[^\s)>\"]+", text)
+    return match.group(0) if match else None
+
+
+def _collect_unique_matches(pattern: str, text: str, limit: int = 12) -> list[str]:
+    values: list[str] = []
+    for raw in re.findall(pattern, text, flags=re.IGNORECASE | re.DOTALL):
+        cleaned = _strip_html_tags(raw) if "<" in raw else raw.strip()
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–|:;,")
+        if cleaned and cleaned not in values:
+            values.append(cleaned)
+        if len(values) >= limit:
+            break
+    return values
 
 
 # ── Session / Memory stores ────────────────────────────────
@@ -321,6 +374,97 @@ def _build_workspace_tools(root: Path) -> tuple[Registry, dict[str, str]]:
             subprocess.run(["open", cleaned], check=True, timeout=5)
             return f"Opened {cleaned}"
 
+    def _web_search(query: str, max_results: int = 5) -> str:
+        cleaned_query = str(query).strip()
+        if not cleaned_query:
+            raise ToolError("Query is required")
+
+        limit = max(1, min(int(max_results), 8))
+        url = "https://html.duckduckgo.com/html/?" + parse.urlencode({"q": cleaned_query})
+        req = urllib_request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; ZEROne/1.0; +https://github.com/tgoapple/zerone)",
+            },
+            method="GET",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=20) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+        except (error.HTTPError, error.URLError, TimeoutError) as exc:
+            raise ToolError(f"Web search failed: {exc}") from exc
+
+        matches = re.findall(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        results: list[str] = []
+        for href, title_html in matches:
+            title = _strip_html_tags(title_html)
+            if not title:
+                continue
+            results.append(f"{title}\n{href}")
+            if len(results) >= limit:
+                break
+
+        if not results:
+            raise ToolError("No web results found")
+        return "\n\n".join(results)
+
+    def _fetch_url(url: str, max_chars: int = 8000) -> str:
+        cleaned_url = str(url).strip()
+        if not cleaned_url.startswith(("http://", "https://")):
+            raise ToolError("URL must start with http:// or https://")
+
+        limit = max(1000, min(int(max_chars), 20000))
+        req = urllib_request.Request(
+            cleaned_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (compatible; ZEROne/1.0; +https://github.com/tgoapple/zerone)",
+            },
+            method="GET",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=20) as resp:
+                html = resp.read().decode("utf-8", errors="replace")
+        except (error.HTTPError, error.URLError, TimeoutError) as exc:
+            raise ToolError(f"URL fetch failed: {exc}") from exc
+
+        title_match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+        desc_match = re.search(
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\'](.*?)["\']',
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        headings = re.findall(r"<h[1-3][^>]*>(.*?)</h[1-3]>", html, flags=re.IGNORECASE | re.DOTALL)
+        classes = re.findall(r'class=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+
+        class_tokens: list[str] = []
+        for class_group in classes:
+            for token in class_group.split():
+                token = token.strip()
+                if token and token not in class_tokens:
+                    class_tokens.append(token)
+                if len(class_tokens) >= 40:
+                    break
+            if len(class_tokens) >= 40:
+                break
+
+        summary_parts = [
+            f"URL: {cleaned_url}",
+            f"Title: {_strip_html_tags(title_match.group(1)) if title_match else '(none)'}",
+            f"Description: {desc_match.group(1).strip() if desc_match else '(none)'}",
+        ]
+        if headings:
+            summary_parts.append("Headings:\n" + "\n".join(f"- {_strip_html_tags(h)[:160]}" for h in headings[:12]))
+        if class_tokens:
+            summary_parts.append("Class tokens:\n" + ", ".join(class_tokens))
+        snippet = _strip_html_tags(html)[:limit]
+        if snippet:
+            summary_parts.append("Text snippet:\n" + snippet)
+        return "\n\n".join(summary_parts)
+
     # Register tools
     reg.register("read_file", {"path": "...", "start?": 1, "end?": 50}, _read)
     reg.register("write_file", {"path": "...", "content": "..."}, _write)
@@ -328,6 +472,8 @@ def _build_workspace_tools(root: Path) -> tuple[Registry, dict[str, str]]:
     reg.register("insert_in_file", {"path": "...", "anchor": "...", "content": "...", "after?": True}, _insert)
     reg.register("list_files", {"path?": "."}, _list)
     reg.register("search_text", {"pattern": "...", "path?": "."}, _search)
+    reg.register("web_search", {"query": "...", "max_results?": 5}, _web_search)
+    reg.register("fetch_url", {"url": "...", "max_chars?": 8000}, _fetch_url)
     reg.register("run_command", {"command": "..."}, _run)
     reg.register("open_target", {"target": "..."}, _open)
 
@@ -389,7 +535,7 @@ Available tools:
 Rules:
 - Never return "final" without having called at least one tool.
 - Never describe a plan. Execute it.
-- If the task is to create or improve a landing page, prefer build_landing_page.
+- If the task is to create or improve a landing page, prefer design_landing_page.
 - If the task involves creating or editing a file, use write_file or replace_in_file.
 - If the task says "open", use open_target after writing.
 - Never emit DSML, XML-like tool markup, or pseudo function-calling syntax.
@@ -410,6 +556,7 @@ MODE_GUIDANCE: dict[str, str] = {
 class Config:
     assistant_name: str = "ZEROne"
     provider_name: str = "deepseek"
+    visual_provider_name: str = "codex"
     model: str | None = None
     persona_path: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "persona.zeron.spec.json")
     skills_dir: Path = field(default_factory=lambda: Path(__file__).resolve().parent / "skills")
@@ -430,6 +577,26 @@ class ToolkitRoute:
 
 
 TOOLKIT_ROUTES: tuple[ToolkitRoute, ...] = (
+    ToolkitRoute(
+        skill_name="reference-browser",
+        signals=("http://", "https://", "reference site", "reference url", "like this site", "inspired by this site"),
+        actions=("inspect", "analyze", "study", "rebuild", "redesign", "match", "influence"),
+        score=18,
+    ),
+    ToolkitRoute(
+        skill_name="research",
+        signals=("search the web", "search web", "look up", "lookup", "find online", "research", "latest", "news", "current"),
+        actions=("search", "look", "find", "research", "check", "compare"),
+        score=14,
+    ),
+    ToolkitRoute(
+        skill_name="design",
+        signals=("landing page", "homepage", "hero section", "visual design", "ui design", "premium", "brand"),
+        actions=("create", "build", "make", "improve", "redesign", "refine", "rewrite"),
+        followup_suffixes=(".html",),
+        followup_actions=("improve", "refine", "redesign", "another pass", "better", "premium"),
+        score=15,
+    ),
     ToolkitRoute(
         skill_name="landing-pages",
         signals=("landing page", "homepage", "hero section", "browser", "html", "site"),
@@ -456,6 +623,24 @@ TOOLKIT_ROUTES: tuple[ToolkitRoute, ...] = (
     ),
 )
 
+VISUAL_REQUEST_SIGNALS: tuple[str, ...] = (
+    "image",
+    "logo",
+    "icon",
+    "svg",
+    "poster",
+    "illustration",
+    "render",
+    "cover art",
+    "album art",
+    "brand mark",
+    "wordmark",
+    "thumbnail",
+    "hero image",
+    "mockup",
+    "visual",
+)
+
 
 # ── The harness ────────────────────────────────────────────
 
@@ -474,6 +659,9 @@ class ZEROne:
 
         # Provider
         self.provider = build_provider(self.config.provider_name, self.config.model)
+        self._provider_models: dict[str, str | None] = {
+            self.provider.name: getattr(self.provider, "model", None),
+        }
 
         # Workspace
         wroot = Path(self.config.workspace_root or Path.home() / "Documents" / "Playground").resolve()
@@ -497,11 +685,81 @@ class ZEROne:
         self._memory_store = MemoryStore(self.config.data_dir / "memories.json")
 
     def _register_creative_tools(self) -> None:
-        def _build_landing_page(
+        def _inspect_reference_url(url: str, max_chars: int = 8000) -> str:
+            cleaned_url = str(url).strip()
+            if not cleaned_url.startswith(("http://", "https://")):
+                return self._call_tool("fetch_url", {"url": cleaned_url, "max_chars": max_chars})
+
+            script_path = Path(__file__).resolve().parent / "reference_inspector.js"
+            try:
+                result = subprocess.run(
+                    ["node", str(script_path), cleaned_url],
+                    capture_output=True,
+                    text=True,
+                    timeout=60,
+                    cwd=str(self._workspace_root),
+                )
+            except subprocess.TimeoutExpired as exc:
+                return f"Tool error: Reference inspection timed out: {exc}"
+
+            if result.returncode != 0 or not result.stdout.strip():
+                fallback = self._call_tool("fetch_url", {"url": cleaned_url, "max_chars": max_chars})
+                if not _tool_result_failed(fallback):
+                    return fallback
+                stderr = (result.stderr or "").strip()
+                return f"Tool error: Reference inspection failed. {stderr[:400]}"
+
+            try:
+                payload = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                fallback = self._call_tool("fetch_url", {"url": cleaned_url, "max_chars": max_chars})
+                if not _tool_result_failed(fallback):
+                    return fallback
+                return f"Tool error: Reference inspection returned invalid JSON: {result.stdout[:240]}"
+
+            hero = payload.get("hero") or {}
+            parts = [
+                f"URL: {cleaned_url}",
+                f"Title: {str(payload.get('title') or '(none)').strip()}",
+                f"Description: {str(payload.get('description') or '(none)').strip()}",
+                f"Body background: {str(payload.get('bodyBackground') or '(unknown)').strip()}",
+                f"Body text color: {str(payload.get('bodyColor') or '(unknown)').strip()}",
+                f"Body font: {str(payload.get('bodyFont') or '(unknown)').strip()}",
+                f"Dark page: {'yes' if payload.get('bodyIsDark') else 'no'}",
+                f"Section count: {int(payload.get('sectionCount') or 0)}",
+                f"Image count: {int(payload.get('imageCount') or 0)}",
+            ]
+            if hero:
+                hero_lines = [
+                    f"- selector: {hero.get('selector', '(unknown)')}",
+                    f"- height: {hero.get('height', '(unknown)')}px",
+                    f"- heading: {hero.get('heading', '(none)')}",
+                    f"- background color: {hero.get('backgroundColor', '(unknown)')}",
+                    f"- background image: {hero.get('backgroundImage', '(none)')}",
+                    f"- text align: {hero.get('textAlign', '(unknown)')}",
+                    f"- classes: {hero.get('className', '(none)')}",
+                ]
+                parts.append("Hero cues:\n" + "\n".join(hero_lines))
+            headings = payload.get("headings") or []
+            if headings:
+                parts.append("Headings:\n" + "\n".join(f"- {str(h)[:160]}" for h in headings[:12]))
+            class_tokens = payload.get("classTokens") or []
+            if class_tokens:
+                parts.append("Class tokens:\n" + ", ".join(str(token) for token in class_tokens[:40]))
+            links = payload.get("links") or []
+            if links:
+                parts.append("Link labels:\n" + "\n".join(f"- {str(link)[:120]}" for link in links[:12]))
+            snippet = str(payload.get("snippet") or "").strip()
+            if snippet:
+                parts.append("Text snippet:\n" + snippet[:max(1000, min(int(max_chars), 12000))])
+            return "\n\n".join(parts)
+
+        def _design_landing_page(
             path: str,
             brief: str,
             mode: str = "create",
             open_after: bool = True,
+            style: str = "auto",
         ) -> str:
             current_html = None
             if mode == "improve":
@@ -509,7 +767,7 @@ class ZEROne:
                     current_html = self._call_tool("read_file", {"path": path})
                 except Exception:
                     current_html = None
-            html = self._generate_page_html(brief, path, current_html=current_html)
+            html = self._generate_page_html(brief, path, current_html=current_html, style=style, specialist=True)
             write_result = self._call_tool("write_file", {"path": path, "content": html})
             opened = ""
             if open_after:
@@ -518,6 +776,35 @@ class ZEROne:
             if opened:
                 status += f"; {opened}"
             return status
+
+        def _build_landing_page(
+            path: str,
+            brief: str,
+            mode: str = "create",
+            open_after: bool = True,
+        ) -> str:
+            return _design_landing_page(path, brief, mode=mode, open_after=open_after, style="auto")
+
+        self._tools.register(
+            "design_landing_page",
+            {
+                "path": "...",
+                "brief": "...",
+                "mode?": "create|improve",
+                "style?": "auto|editorial|product|luxury|minimal|bold",
+                "open_after?": True,
+            },
+            _design_landing_page,
+        )
+
+        self._tools.register(
+            "inspect_reference_url",
+            {
+                "url": "...",
+                "max_chars?": 8000,
+            },
+            _inspect_reference_url,
+        )
 
         self._tools.register(
             "build_landing_page",
@@ -528,6 +815,116 @@ class ZEROne:
                 "open_after?": True,
             },
             _build_landing_page,
+        )
+
+        # ── Knowledge base (wiki) tools ────────────────
+        def _wiki_add(title: str, content: str, tags: str = "") -> str:
+            wiki_dir = self._workspace_root / "llm-wiki"
+            wiki_dir.mkdir(parents=True, exist_ok=True)
+            slug = title.lower().replace(" ", "-").replace("/", "-")[:60]
+            path = wiki_dir / f"{slug}.md"
+            tag_line = f"tags: {tags}\n" if tags else ""
+            entry = f"# {title}\n\n{tag_line}{content}\n"
+            path.write_text(entry)
+            return f"Saved wiki entry '{title}' to {path}"
+
+        def _wiki_search(query: str) -> str:
+            wiki_dir = self._workspace_root / "llm-wiki"
+            if not wiki_dir.exists():
+                return "No wiki entries yet."
+            results = []
+            for f in sorted(wiki_dir.glob("*.md")):
+                text = f.read_text()
+                if query.lower() in text.lower():
+                    title = text.split("\n")[0].lstrip("# ").strip()
+                    results.append(f"- {title} ({f.name})")
+            if not results:
+                return f"No wiki entries matching '{query}'."
+            return "Wiki entries:\n" + "\n".join(results[-10:])
+
+        def _wiki_list() -> str:
+            wiki_dir = self._workspace_root / "llm-wiki"
+            if not wiki_dir.exists():
+                return "No wiki entries yet."
+            entries = []
+            for f in sorted(wiki_dir.glob("*.md")):
+                title = f.read_text().split("\n")[0].lstrip("# ").strip()
+                entries.append(f"- {title} ({f.name})")
+            if not entries:
+                return "No wiki entries yet."
+            return "Wiki entries:\n" + "\n".join(entries)
+
+        self._tools.register(
+            "wiki_add",
+            {"title": "...", "content": "...", "tags?": "..."},
+            _wiki_add,
+        )
+        self._tools.register(
+            "wiki_search",
+            {"query": "..."},
+            _wiki_search,
+        )
+        self._tools.register(
+            "wiki_list",
+            {},
+            _wiki_list,
+        )
+
+        # ── Session memory tools ────────────────────────
+        def _recall_session() -> str:
+            ctx = self._session_memory_context()
+            return ctx
+
+        def _save_memory(text: str) -> str:
+            result = self.remember(text)
+            return f"Saved: {result.get('id', 'unknown')}"
+
+        def _list_memories() -> str:
+            mems = self.list_memories()
+            if not mems:
+                return "No memories stored."
+            return "\n".join(f"- [{m.get('id','?')[:8]}] {m.get('content','')[:120]}" for m in mems[-10:])
+
+        self._tools.register(
+            "recall_session",
+            {},
+            _recall_session,
+        )
+        self._tools.register(
+            "save_memory",
+            {"text": "..."},
+            _save_memory,
+        )
+        self._tools.register(
+            "list_memories",
+            {},
+            _list_memories,
+        )
+
+        # ── Design polish tools ─────────────────────────
+        def _polish_page(path: str) -> str:
+            content = self._call_tool("read_file", {"path": path})
+            if _tool_result_failed(content):
+                return content
+            if "<html" not in content and "<!DOCTYPE" not in content:
+                return "Not an HTML file."
+            prompt = (
+                f"Polish this HTML page to feel editorial and intentional. "
+                f"Use a dark palette (graphite/ultraviolet/cobalt). "
+                f"Improve typography, spacing, and visual hierarchy. "
+                f"Keep all existing content. Return only the full HTML.\n\n{content[:6000]}"
+            )
+            polished = self._generate_page_html(
+                prompt, path, current_html=content, style="editorial", specialist=False
+            )
+            self._call_tool("write_file", {"path": path, "content": polished})
+            self._call_tool("open_target", {"target": path})
+            return f"Polished {path} with editorial styling and opened in browser."
+
+        self._tools.register(
+            "polish_page",
+            {"path": "..."},
+            _polish_page,
         )
 
     # ── Session memory compounding ────────────────────────
@@ -709,7 +1106,11 @@ class ZEROne:
         return names
 
     def _effective_skill_names(self, user_text: str, session: dict[str, Any] | None = None) -> list[str]:
-        return list(self._active_skills)
+        effective = list(self._active_skills)
+        for name in self._auto_skill_names(user_text, session=session):
+            if name not in effective:
+                effective.append(name)
+        return effective
 
     # ── Public API ──────────────────────────────────────
 
@@ -745,11 +1146,14 @@ class ZEROne:
         }
 
     def set_provider(self, name: str) -> None:
-        self.provider = build_provider(name, getattr(self.provider, "model", None))
+        self._provider_models[self.provider.name] = getattr(self.provider, "model", None)
+        self.provider = build_provider(name, self._provider_models.get(name))
+        self._provider_models[self.provider.name] = getattr(self.provider, "model", None)
         self.config.provider_name = name
 
     def set_model(self, model: str) -> None:
         self.provider.model = model
+        self._provider_models[self.provider.name] = model
 
     def set_mode(self, mode: str) -> None:
         self.config.companion_mode = mode
@@ -823,6 +1227,27 @@ class ZEROne:
         except KeyError as exc:
             msg = f"You are {self.name}.\n{p.get('purpose', '')}\n\nContext:\n{snapshot}\n\n{mem_ctx}"
             return msg
+
+    def _is_visual_request(self, user_text: str) -> bool:
+        lowered = user_text.lower()
+        if not _contains_any(lowered, VISUAL_REQUEST_SIGNALS):
+            return False
+        if _contains_any(lowered, ("landing page", "homepage", "page", "site", "html", "browser")):
+            return False
+        return _contains_any(lowered, ("create", "make", "design", "generate", "draw", "craft", "build", "need", "want"))
+
+    def _provider_for_request(self, user_text: str) -> BaseProvider:
+        if not self._is_visual_request(user_text):
+            return self.provider
+        preferred = (self.config.visual_provider_name or "codex").strip().lower()
+        if preferred == self.provider.name:
+            return self.provider
+        try:
+            routed = build_provider(preferred, self._provider_models.get(preferred))
+        except ProviderError:
+            return self.provider
+        self._provider_models[routed.name] = getattr(routed, "model", None)
+        return routed
 
     # ── Operator detection ─────────────────────────────
 
@@ -1065,27 +1490,253 @@ class ZEROne:
 </body>
 </html>"""
 
-    def _generate_page_html(self, task: str, target: str, current_html: str | None = None) -> str:
-        system_prompt = (
-            "Return only complete HTML for a polished landing page. "
-            "No markdown fences. No explanation. "
-            "Use refined typography, layered backgrounds, strong spacing, and a premium but calm visual tone. "
-            "Keep it self-contained with inline CSS and mobile responsive."
+    def _derive_unsplash_query(self, task: str, target: str) -> str:
+        query = _clean_visual_query(task)
+        if query:
+            return query
+        target_hint = _clean_visual_query(Path(target).stem.replace("-", " ").replace("_", " "))
+        return target_hint or "editorial lifestyle"
+
+    def _design_direction(self, task: str, target: str, style: str = "auto") -> dict[str, str]:
+        lowered = f"{task} {target}".lower()
+        forced = (style or "auto").strip().lower()
+
+        presets: dict[str, dict[str, str]] = {
+            "editorial": {
+                "name": "editorial",
+                "guidance": "Use a restrained editorial feel: elegant typography, asymmetric composition, confident whitespace, quiet luxury, and strong image-led storytelling.",
+            },
+            "product": {
+                "name": "product",
+                "guidance": "Use a premium product-marketing feel: crisp hierarchy, sharp demos, clean conversion moments, and restrained supporting sections.",
+            },
+            "luxury": {
+                "name": "luxury",
+                "guidance": "Use a luxury brand feel: refined restraint, rich materials, calmer pacing, elevated serif/sans pairing, and understated polish over noise.",
+            },
+            "minimal": {
+                "name": "minimal",
+                "guidance": "Use a severe minimal direction: fewer sections, harder editing, cleaner typography, deliberate spacing, and no decorative clutter.",
+            },
+            "bold": {
+                "name": "bold",
+                "guidance": "Use a bold contemporary direction: higher contrast, stronger type, distinctive layout shifts, and a more assertive visual rhythm.",
+            },
+        }
+
+        if forced in presets:
+            return presets[forced]
+        if any(word in lowered for word in ("luxury", "premium", "elegant", "high-end", "quiet luxury", "fashion", "hotel", "fragrance", "skincare")):
+            return presets["luxury"]
+        if any(word in lowered for word in ("minimal", "clean", "simple", "quiet", "calm", "monastic")):
+            return presets["minimal"]
+        if any(word in lowered for word in ("bold", "energetic", "experimental", "campaign", "poster")):
+            return presets["bold"]
+        if any(word in lowered for word in ("app", "saas", "dashboard", "product", "platform", "tool")):
+            return presets["product"]
+        return presets["editorial"]
+
+    def _fetch_unsplash_reference(self, task: str, target: str) -> dict[str, str] | None:
+        access_key = os.environ.get("UNSPLASH_ACCESS_KEY") or os.environ.get("MIP_UNSPLASH_ACCESS_KEY") or ""
+        if not access_key:
+            return None
+
+        query = self._derive_unsplash_query(task, target)
+        url = "https://api.unsplash.com/search/photos?" + parse.urlencode(
+            {
+                "query": query,
+                "orientation": "landscape",
+                "per_page": 1,
+                "content_filter": "high",
+            }
         )
+        req = urllib_request.Request(
+            url,
+            headers={
+                "Authorization": f"Client-ID {access_key}",
+                "Accept-Version": "v1",
+            },
+            method="GET",
+        )
+        try:
+            with urllib_request.urlopen(req, timeout=20) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except (error.HTTPError, error.URLError, TimeoutError, json.JSONDecodeError):
+            return None
+
+        results = raw.get("results", [])
+        if not results:
+            return None
+        first = results[0] or {}
+        urls = first.get("urls", {}) or {}
+        user = first.get("user", {}) or {}
+        links = user.get("links", {}) or {}
+        image_url = str(urls.get("regular") or urls.get("full") or urls.get("raw") or "").strip()
+        photographer = str(user.get("name") or "Unsplash photographer").strip()
+        photographer_url = str(links.get("html") or "https://unsplash.com").strip()
+        if not image_url:
+            return None
+        return {
+            "query": query,
+            "image_url": image_url,
+            "photographer": photographer,
+            "photographer_url": photographer_url,
+        }
+
+    def _analyze_reference_url(self, task: str) -> dict[str, Any] | None:
+        url = _extract_url(task)
+        if not url:
+            return None
+        inspected = self._call_tool("inspect_reference_url", {"url": url, "max_chars": 12000})
+        fetched = inspected
+        if not str(fetched).strip() or _tool_result_failed(fetched):
+            fetched = self._call_tool("fetch_url", {"url": url, "max_chars": 12000})
+        if _tool_result_failed(fetched):
+            return None
+
+        class_tokens_line = ""
+        headings_block = ""
+        snippet_block = ""
+        for block in fetched.split("\n\n"):
+            if block.startswith("Class tokens:"):
+                class_tokens_line = block
+            elif block.startswith("Headings:"):
+                headings_block = block
+            elif block.startswith("Text snippet:"):
+                snippet_block = block
+
+        class_tokens = [token.strip() for token in class_tokens_line.replace("Class tokens:", "").split(",") if token.strip()]
+        classes_lower = " ".join(class_tokens).lower()
+        headings = [line[2:].strip() for line in headings_block.splitlines() if line.startswith("- ")]
+        snippet = snippet_block.replace("Text snippet:\n", "").strip()
+
+        mood: list[str] = []
+        layout: list[str] = []
+        components: list[str] = []
+
+        if any(token in classes_lower for token in ("dark", "black", "inverse", "night")):
+            mood.append("dark, high-contrast visual tone")
+        if any(token in classes_lower for token in ("hero", "fullscreen", "fullheight", "banner")):
+            layout.append("full-screen or oversized hero section")
+        if any(token in classes_lower for token in ("masonry", "portfolio", "grid", "gallery")):
+            components.append("portfolio or masonry-style grid section")
+        if any(token in classes_lower for token in ("diagonal", "shape", "overlay", "mask", "line")):
+            components.append("geometric accents, overlays, or directional shapes")
+        if any(token in classes_lower for token in ("agency", "creative", "studio")):
+            mood.append("creative-agency presentation style")
+
+        lower_snippet = snippet.lower()
+        if "portfolio" in lower_snippet or "selected work" in lower_snippet:
+            components.append("project showcase framing")
+        if "creative agency" in lower_snippet or "agency" in lower_snippet:
+            mood.append("agency-like brand posture")
+        if "scroll" in lower_snippet or "hover" in lower_snippet:
+            components.append("subtle motion or hover treatment")
+
+        if headings:
+            first_heading = headings[0]
+            if len(first_heading.split()) <= 8:
+                layout.append("bold concise hero headline")
+
+        summary_lines = []
+        if mood:
+            summary_lines.append("Mood: " + "; ".join(dict.fromkeys(mood)))
+        if layout:
+            summary_lines.append("Layout: " + "; ".join(dict.fromkeys(layout)))
+        if components:
+            summary_lines.append("Components: " + "; ".join(dict.fromkeys(components)))
+        if headings:
+            summary_lines.append("Headings: " + "; ".join(headings[:5]))
+        if class_tokens:
+            summary_lines.append("Class cues: " + ", ".join(class_tokens[:18]))
+        if "Dark page: yes" in fetched:
+            summary_lines.append("Overall: dark rendered page")
+        hero_heading_match = re.search(r"- heading: (.+)", fetched)
+        if hero_heading_match:
+            summary_lines.append("Hero: " + hero_heading_match.group(1).strip())
+        hero_background_match = re.search(r"- background image: (.+)", fetched)
+        if hero_background_match and hero_background_match.group(1).strip() not in {"", "(none)"}:
+            summary_lines.append("Hero background uses an image treatment")
+
+        return {
+            "url": url,
+            "summary": "\n".join(summary_lines).strip(),
+        }
+
+    def _generate_page_html(
+        self,
+        task: str,
+        target: str,
+        current_html: str | None = None,
+        style: str = "auto",
+        specialist: bool = False,
+        provider: BaseProvider | None = None,
+    ) -> str:
+        active_provider = provider or self._provider_for_request(task)
+        unsplash = self._fetch_unsplash_reference(task, target)
+        reference = self._analyze_reference_url(task) if specialist else None
+        direction = self._design_direction(task, target, style=style)
+        system_prompt = (
+            "Return only complete HTML for a premium single-file landing page. "
+            "No markdown fences. No explanation. "
+            "The design must feel intentional and high taste, not generic AI SaaS sludge. "
+            "Avoid weak default chatgpt-style layouts, purple-on-white palettes, bland card farms, filler icons, and empty marketing copy. "
+            "Use a strong visual concept, disciplined spacing, sharper hierarchy, and distinctive typography choices that still load safely from standard web fonts or tasteful fallbacks. "
+            "Make the page self-contained with inline CSS and mobile responsive. "
+            "Prefer fewer, better sections over many shallow ones. "
+            "Each section must earn its place. "
+            "If the user asks for a specific style, obey it exactly instead of reverting to a generic template. "
+            "Before finishing, internally check that the result looks premium, aligned, coherent, and not like a throwaway startup template. "
+            "If an Unsplash image reference is provided, use it directly as a real image rather than drawing fake placeholders."
+        )
+        if specialist:
+            system_prompt += (
+                " You are acting as a dedicated design specialist. "
+                "Do not settle for serviceable. Push for art direction, balance, alignment, and stronger taste."
+            )
+        unsplash_brief = ""
+        if unsplash:
+            unsplash_brief = (
+                "\n\nUnsplash image reference:\n"
+                f"- search query: {unsplash['query']}\n"
+                f"- hotlink image URL: {unsplash['image_url']}\n"
+                f"- photographer credit: Photo by {unsplash['photographer']} on Unsplash\n"
+                f"- photographer profile: {unsplash['photographer_url']}\n"
+                "Use this image if it fits the brief. Keep the direct image URL intact and include tasteful visible credit somewhere on the page."
+            )
+        reference_brief = ""
+        if reference and reference.get("summary"):
+            reference_brief = (
+                "\n\nReference site analysis:\n"
+                f"- source URL: {reference['url']}\n"
+                f"{reference['summary']}\n"
+                "Translate these cues into the new design directly. "
+                "Do not just make a generic premium site. "
+                "Echo the reference's silhouette, pacing, contrast, and composition while still producing an original page."
+            )
         if current_html:
             user_prompt = (
                 f"Improve this existing page for the request: {task}\n"
                 f"Keep the same file target: {target}\n\n"
+                f"Design direction: {direction['name']}.\n{direction['guidance']}\n\n"
+                "Improve the design quality substantially rather than making tiny cosmetic changes. "
+                "Fix weak composition, bad alignment, generic rhythm, and anything that feels cheap or placeholder-like.\n\n"
                 "Current HTML:\n"
                 f"{current_html}"
+                f"{unsplash_brief}"
+                f"{reference_brief}"
             )
         else:
             user_prompt = (
                 f"Create a well-designed landing page for the request: {task}\n"
-                f"Use this file target as context: {target}"
+                f"Use this file target as context: {target}\n\n"
+                f"Design direction: {direction['name']}.\n{direction['guidance']}\n\n"
+                "Aim for a page that a design-conscious human would actually keep."
+                f"{unsplash_brief}"
+                f"{reference_brief}"
             )
         try:
-            raw = self.provider.generate(system_prompt, [{"role": "user", "content": user_prompt}]).strip()
+            raw = active_provider.generate(system_prompt, [{"role": "user", "content": user_prompt}]).strip()
         except ProviderError:
             raw = ""
         html = _extract_html(raw) or (raw if "<html" in raw.lower() or "<!doctype html>" in raw.lower() else "")
@@ -1125,13 +1776,13 @@ class ZEROne:
         if improve:
             if is_page_task:
                 result = self._call_tool(
-                    "build_landing_page",
-                    {"path": target, "brief": task, "mode": "improve", "open_after": True},
+                    "design_landing_page",
+                    {"path": target, "brief": task, "mode": "improve", "style": "auto", "open_after": True},
                 )
                 return {
                     "message": f"Improved and opened {target}.",
                     "steps": [
-                        {"tool": "build_landing_page", "args": {"path": target, "brief": task, "mode": "improve", "open_after": True}, "reason": "rewrite the page with a stronger second pass", "result": result},
+                        {"tool": "design_landing_page", "args": {"path": target, "brief": task, "mode": "improve", "style": "auto", "open_after": True}, "reason": "send the page through the design specialist for a stronger second pass", "result": result},
                     ],
                 }
             try:
@@ -1152,13 +1803,13 @@ class ZEROne:
         if create:
             if is_page_task:
                 result = self._call_tool(
-                    "build_landing_page",
-                    {"path": target, "brief": task, "mode": "create", "open_after": True},
+                    "design_landing_page",
+                    {"path": target, "brief": task, "mode": "create", "style": "auto", "open_after": True},
                 )
                 return {
                     "message": f"Created and opened {target}.",
                     "steps": [
-                        {"tool": "build_landing_page", "args": {"path": target, "brief": task, "mode": "create", "open_after": True}, "reason": "create the requested page", "result": result},
+                        {"tool": "design_landing_page", "args": {"path": target, "brief": task, "mode": "create", "style": "auto", "open_after": True}, "reason": "send the page through the design specialist", "result": result},
                     ],
                 }
             html = self._generate_page_html(task, target)
@@ -1182,10 +1833,12 @@ class ZEROne:
         session: dict[str, Any] | None = None,
         max_steps: int = 6,
         skill_names: list[str] | None = None,
+        provider: BaseProvider | None = None,
     ) -> dict[str, Any]:
         history: list[dict[str, str]] = []
         steps: list[dict[str, Any]] = []
         tool_names = self._tool_names_for_skills(skill_names)
+        active_provider = provider or self._provider_for_request(task)
 
         for _ in range(max_steps):
             messages: list[dict[str, str]] = [{"role": "user", "content": f"Task: {task}"}]
@@ -1202,7 +1855,7 @@ class ZEROne:
             prompt = SKILL_AGENT_PROMPT.replace("{tool_schemas}", schemas)
 
             try:
-                raw = self.provider.generate(prompt, messages)
+                raw = active_provider.generate(prompt, messages)
             except ProviderError as exc:
                 return {"message": f"Provider error: {exc}", "steps": steps}
 
@@ -1254,7 +1907,7 @@ class ZEROne:
         if tool_name == "open_target":
             if "target" not in normalized and "path" in normalized:
                 normalized["target"] = normalized.pop("path")
-        if tool_name == "build_landing_page":
+        if tool_name in {"build_landing_page", "design_landing_page"}:
             if "path" not in normalized:
                 normalized["path"] = self._operator_target("landing page", session=session) or self._default_page_target()
             if "brief" not in normalized:
@@ -1264,6 +1917,8 @@ class ZEROne:
                 normalized["brief"] = " | ".join(parts) if parts else "Create a premium landing page."
             if "mode" not in normalized:
                 normalized["mode"] = "create"
+            if tool_name == "design_landing_page" and "style" not in normalized:
+                normalized["style"] = "auto"
             if "open_after" not in normalized:
                 normalized["open_after"] = True
             elif isinstance(normalized["open_after"], str):
@@ -1289,12 +1944,36 @@ class ZEROne:
             })
         return steps
 
+    def _format_action_reply(
+        self,
+        surface: str,
+        tool: str,
+        args: dict[str, Any],
+        message: str = "Done.",
+    ) -> str:
+        host_note = " on this Mac" if surface == "telegram" else ""
+        if tool == "open_target":
+            target = str(args.get("target", "")).strip()
+            return f"Opened {target}{host_note}."
+        if tool in {"build_landing_page", "design_landing_page"}:
+            path = str(args.get("path", "")).strip()
+            mode = str(args.get("mode", "create"))
+            if mode == "improve":
+                return f"Improved and opened {path}{host_note}."
+            return f"Created and opened {path}{host_note}."
+        if tool == "write_file":
+            path = str(args.get("path", "")).strip()
+            return f"Written to {path}."
+        return message.strip() or "Done."
+
     # ── Main reply ─────────────────────────────────────
 
     def reply(self, session_id: str, user_text: str, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
         session = self._safe_load_session(session_id)
+        surface = str((metadata or {}).get("surface", "")).strip().lower()
         effective_text = self._contextualize_request(user_text, session)
         effective_skills = self._effective_skill_names(effective_text, session=session)
+        active_provider = self._provider_for_request(effective_text)
 
         # Store memory for facts
         try:
@@ -1341,16 +2020,13 @@ class ZEROne:
 
                 if _tool_result_failed(last_result):
                     reply_content = last_result
-                elif last_tool == "open_target":
-                    reply_content = f"Opened {last_args.get('target', '')} in the browser."
-                elif last_tool == "build_landing_page":
-                    path = last_args.get("path", "")
-                    mode = str(last_args.get("mode", "create"))
-                    reply_content = f"Improved and opened {path}." if mode == "improve" else f"Created and opened {path}."
-                elif last_tool == "write_file":
-                    reply_content = f"Written to {last_args.get('path', '')}."
                 else:
-                    reply_content = str(direct_result.get("message", "Done.")).strip() or "Done."
+                    reply_content = self._format_action_reply(
+                        surface,
+                        last_tool,
+                        last_args,
+                        str(direct_result.get("message", "Done.")),
+                    )
 
                 loop_filtered, loop_report = filter_response(reply_content, self._adapter, context={"query": user_text})
                 if loop_report.overall_passed:
@@ -1358,7 +2034,7 @@ class ZEROne:
                 consistency_score = round(loop_report.overall_score, 3)
 
                 meta: dict[str, Any] = {
-                    "provider": self.provider.name,
+                    "provider": active_provider.name,
                     "mode": self.config.companion_mode,
                     "active_skills": list(self._active_skills),
                     "auto_skills": [name for name in effective_skills if name not in self._active_skills],
@@ -1380,12 +2056,12 @@ class ZEROne:
                 return assistant_msg
 
         try:
-            draft = self.provider.generate(self._build_prompt(effective_text, session, skill_names=effective_skills), model_messages)
+            draft = active_provider.generate(self._build_prompt(effective_text, session, skill_names=effective_skills), model_messages)
         except ProviderError as exc:
             # Save user message but return error gracefully
             assistant_msg: dict[str, Any] = {
                 "id": str(uuid.uuid4()), "role": "assistant", "content": f"Sorry — provider error: {exc}",
-                "created_at": utc_now(), "meta": {"provider": self.provider.name, "error": str(exc)},
+                "created_at": utc_now(), "meta": {"provider": active_provider.name, "error": str(exc)},
             }
             session["messages"].append(assistant_msg)
             self._update_meta(session, user_text)
@@ -1409,13 +2085,13 @@ class ZEROne:
                 if only_reads and _contains_any(effective_text.lower(), ("improve", "refine", "redesign", "rewrite", "another pass", "premium", "better")):
                     loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
                     if loop_result is None:
-                        loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills)
+                        loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills, provider=active_provider)
                 else:
                     loop_result = {"message": "Executed tool actions.", "steps": dsml_steps}
             else:
                 loop_result = self._execute_operator_shortcut(effective_text, session=session, skill_names=effective_skills)
                 if loop_result is None:
-                    loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills)
+                    loop_result = self._agent_loop(effective_text, session=session, skill_names=effective_skills, provider=active_provider)
             if loop_result:
                 agent_steps = loop_result.get("steps", [])
 
@@ -1426,35 +2102,55 @@ class ZEROne:
                     result_text = str(agent_steps[-1].get("result", ""))
                     if _tool_result_failed(result_text):
                         reply_content = result_text
-                    elif tool == "open_target":
-                        target = last_args.get("target", "")
-                        reply_content = f"Opened {target} in the browser."
-                    elif tool == "build_landing_page":
-                        path = last_args.get("path", "")
-                        mode = str(last_args.get("mode", "create"))
-                        if mode == "improve":
-                            reply_content = f"Improved and opened {path}."
-                        else:
-                            reply_content = f"Created and opened {path}."
-                    elif tool == "write_file":
-                        path = last_args.get("path", "")
-                        reply_content = f"Written to {path}."
                     else:
-                        reply_content = loop_result.get("message", "Done.")
+                        reply_content = self._format_action_reply(
+                            surface,
+                            tool,
+                            last_args,
+                            str(loop_result.get("message", "Done.")),
+                        )
 
                 # Fallback: extract HTML from the draft if model blathered instead of working
                 if not agent_steps:
                     html = _extract_html(draft)
                     if html:
                         try:
-                            self._call_tool("write_file", {"path": "index.html", "content": html})
-                            self._call_tool("open_target", {"target": "index.html"})
-                            agent_steps = [{"tool": "write_file", "args": {"path": "index.html"}, "reason": "write generated HTML", "result": f"wrote {len(html)} chars"}]
-                            reply_content = "Created and opened index.html in the browser."
+                            target = self._operator_target(effective_text, session) or self._default_page_target()
+                            write_result = self._call_tool("write_file", {"path": target, "content": html})
+                            open_result = self._call_tool("open_target", {"target": target})
+                            agent_steps = [
+                                {"tool": "write_file", "args": {"path": target}, "reason": "write generated HTML", "result": write_result},
+                                {"tool": "open_target", "args": {"target": target}, "reason": "open the generated page", "result": open_result},
+                            ]
+                            reply_content = self._format_action_reply(
+                                surface,
+                                "open_target",
+                                {"target": target},
+                                f"Created and opened {target}.",
+                            )
                         except ToolError as exc:
-                            agent_steps = [{"tool": "write_file", "args": {"path": "index.html"}, "result": str(exc)}]
+                            agent_steps = [{"tool": "write_file", "args": {"path": target}, "result": str(exc)}]
                     else:
                         reply_content = loop_result.get("message", "Done.")
+
+        if surface == "telegram" and not agent_steps and _looks_like_code_dump(reply_content):
+            html = _extract_html(reply_content)
+            if html:
+                target = self._operator_target(effective_text, session) or self._default_page_target()
+                write_result = self._call_tool("write_file", {"path": target, "content": html})
+                open_result = self._call_tool("open_target", {"target": target})
+                agent_steps = [
+                    {"tool": "write_file", "args": {"path": target}, "reason": "write generated HTML", "result": write_result},
+                    {"tool": "open_target", "args": {"target": target}, "reason": "open the generated page", "result": open_result},
+                ]
+                reply_content = self._format_action_reply(
+                    surface,
+                    "open_target",
+                    {"target": target},
+                    f"Created and opened {target}.",
+                )
+            else:
+                reply_content = "I generated code there when I should have handled it as an action. Ask me again and I'll write it to a file instead of dumping it into Telegram."
 
                 # Run character adapter on agent loop result
                 if reply_content:
@@ -1464,7 +2160,7 @@ class ZEROne:
                     consistency_score = round(loop_report.overall_score, 3)
 
         meta: dict[str, Any] = {
-            "provider": self.provider.name,
+            "provider": active_provider.name,
             "mode": self.config.companion_mode,
             "active_skills": list(self._active_skills),
             "auto_skills": [name for name in effective_skills if name not in self._active_skills],
