@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Any
 from urllib import error, request as urllib_request
 
@@ -52,6 +56,27 @@ def build_chat_body(system_prompt: str, messages: list[dict[str, str]]) -> list[
     for m in messages:
         body.append({"role": m.get("role", "user"), "content": m["content"]})
     return body
+
+
+def build_codex_prompt(system_prompt: str, messages: list[dict[str, str]]) -> str:
+    lines = [
+        "You are the language-model backend for another assistant runtime.",
+        "Return only the assistant's next reply as plain text.",
+        "Do not run tools, execute commands, or mention sandboxing, approvals, or environment limits unless the conversation explicitly asks about them.",
+        "",
+        "SYSTEM PROMPT",
+        system_prompt.strip(),
+        "",
+        "CONVERSATION",
+    ]
+    for message in messages:
+        role = str(message.get("role", "user")).strip().lower() or "user"
+        content = str(message.get("content", "")).strip()
+        lines.append(f"{role.upper()}:")
+        lines.append(content)
+        lines.append("")
+    lines.append("ASSISTANT:")
+    return "\n".join(lines).strip()
 
 
 # ── Real providers ──────────────────────────────────────────
@@ -166,6 +191,73 @@ class OllamaProvider(BaseProvider):
         return _retry_generate(attempt, "Ollama")
 
 
+class CodexProvider(BaseProvider):
+    name = "codex"
+
+    def __init__(self, model: str | None = None, binary: str | None = None):
+        self.model = model or os.environ.get("MIP_CODEX_MODEL", "gpt-5.4")
+        self.binary = binary or os.environ.get("CODEX_CLI_BIN", "codex")
+
+    def _resolve_binary(self) -> str:
+        resolved = shutil.which(self.binary) if os.path.sep not in self.binary else self.binary
+        if not resolved:
+            raise ProviderError("Codex CLI is not installed or not on PATH.")
+        return resolved
+
+    def generate(self, system_prompt: str, messages: list[dict[str, str]]) -> str:
+        prompt = build_codex_prompt(system_prompt, messages)
+        output_fd, output_path = tempfile.mkstemp(prefix="zerone-codex-", suffix=".txt")
+        os.close(output_fd)
+
+        cmd = [
+            self._resolve_binary(),
+            "exec",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "--color",
+            "never",
+            "--sandbox",
+            "read-only",
+            "--output-last-message",
+            output_path,
+            "--model",
+            self.model,
+            "-",
+        ]
+
+        def attempt() -> str:
+            try:
+                completed = subprocess.run(
+                    cmd,
+                    input=prompt,
+                    text=True,
+                    capture_output=True,
+                    timeout=240,
+                    check=False,
+                )
+            except OSError as exc:
+                raise ProviderError(f"Codex request failed: {exc}") from exc
+            except subprocess.TimeoutExpired as exc:
+                raise ProviderError("Codex request timed out.") from exc
+
+            if completed.returncode != 0:
+                details = (completed.stderr or completed.stdout or "").strip()
+                raise ProviderError(f"Codex request failed: {details or f'exit code {completed.returncode}'}")
+
+            content = Path(output_path).read_text(encoding="utf-8").strip()
+            if not content:
+                raise ProviderError("Codex response missing content.")
+            return content
+
+        try:
+            return _retry_generate(attempt, "Codex")
+        finally:
+            try:
+                os.remove(output_path)
+            except OSError:
+                pass
+
+
 # ── Factory ────────────────────────────────────────────────
 
 
@@ -177,4 +269,6 @@ def build_provider(name: str, model: str | None = None) -> BaseProvider:
         return DeepSeekProvider(model=model)
     if normalized == "ollama":
         return OllamaProvider(model=model)
-    raise ProviderError(f"Unknown provider: {normalized}. Valid options: openai, deepseek, ollama.")
+    if normalized == "codex":
+        return CodexProvider(model=model)
+    raise ProviderError(f"Unknown provider: {normalized}. Valid options: openai, deepseek, ollama, codex.")

@@ -51,7 +51,7 @@ def _accent(text: str) -> str:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="ZEROne — Persona Runtime")
     parser.add_argument("--name", default="ZEROne")
-    parser.add_argument("--provider", default="deepseek", choices=["openai", "deepseek", "ollama"])
+    parser.add_argument("--provider", default="deepseek", choices=["openai", "deepseek", "ollama", "codex"])
     parser.add_argument("--model", default=None)
     parser.add_argument("--session", default="main")
     parser.add_argument("--companion-mode", default="companion",
@@ -217,6 +217,7 @@ def main() -> int:
     z = ZEROne(Config(
         assistant_name=args.name,
         provider_name=args.provider,
+        visual_provider_name=os.environ.get("MIP_VISUAL_PROVIDER", "codex"),
         model=args.model,
         companion_mode=args.companion_mode,
         workspace_root=workspace,
@@ -289,8 +290,8 @@ def main() -> int:
             continue
         if raw.startswith("/provider "):
             name = raw.split(" ", 1)[1].strip().lower()
-            if name not in ("openai", "deepseek", "ollama"):
-                print(f"  {_accent('error')}  provider must be: deepseek, openai, ollama")
+            if name not in ("openai", "deepseek", "ollama", "codex"):
+                print(f"  {_accent('error')}  provider must be: deepseek, openai, ollama, codex")
                 continue
             z.set_provider(name)
             print(f"  {_accent('provider')}  {z.provider.name} / {getattr(z.provider, 'model', 'default')}")

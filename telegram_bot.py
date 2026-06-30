@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib import error, request as urllib_request
 
-from zerone import Config, ZEROne
+from zerone import Config, ZEROne, _extract_html, _looks_like_code_dump
 
 TELEGRAM_TEXT_LIMIT = 3900
 
@@ -33,8 +33,16 @@ def call_telegram(method: str, token: str, payload: dict[str, Any] | None = None
         body = json.dumps(payload).encode("utf-8")
         headers["Content-Type"] = "application/json"
     req = urllib_request.Request(url, data=body, headers=headers, method="POST")
-    with urllib_request.urlopen(req, timeout=120) as response:
-        data = json.loads(response.read().decode("utf-8"))
+    import sys as _sys
+    try:
+        with urllib_request.urlopen(req, timeout=120) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        _sys.stderr.write(f"call_telegram HTTP {exc.code} for {method}: {exc.reason}\n")
+        _sys.stderr.flush()
+        if exc.code == 409:
+            raise  # let the caller retry
+        raise RuntimeError(f"HTTP {exc.code}: {exc.reason}")
     if not data.get("ok", True):
         description = data.get("description", "Telegram request failed.")
         raise RuntimeError(description)
@@ -88,6 +96,31 @@ def send_message(token: str, chat_id: int, text: str) -> None:
         )
 
 
+def _summarize_telegram_reply(reply: dict[str, Any]) -> str:
+    content = str(reply.get("content", "")).strip()
+    meta = reply.get("meta", {}) or {}
+    steps = meta.get("agent_steps", []) or []
+    if steps:
+        last = steps[-1]
+        tool = str(last.get("tool", "")).strip()
+        args = last.get("args", {}) or {}
+        if tool == "open_target":
+            return f"Opened {args.get('target', '')} on this Mac."
+        if tool == "build_landing_page":
+            path = str(args.get("path", "")).strip()
+            mode = str(args.get("mode", "create"))
+            if mode == "improve":
+                return f"Improved and opened {path} on this Mac."
+            return f"Created and opened {path} on this Mac."
+        if tool == "write_file":
+            return f"Written to {args.get('path', '')}."
+    if _extract_html(content) is not None:
+        return "I wrote the page, but I’m not going to dump the raw HTML into Telegram."
+    if _looks_like_code_dump(content):
+        return "I handled that as code, but I’m keeping the raw code out of Telegram."
+    return content
+
+
 def _typing_pulse(token: str, chat_id: int, stop: threading.Event) -> None:
     while not stop.is_set():
         try:
@@ -124,6 +157,7 @@ def _build_agent(args: argparse.Namespace) -> ZEROne:
         Config(
             assistant_name=args.name,
             provider_name=args.provider,
+            visual_provider_name=os.environ.get("MIP_VISUAL_PROVIDER", "codex"),
             model=args.model,
             workspace_root=args.workspace,
             data_dir=Path(__file__).resolve().parent / "data",
@@ -166,7 +200,7 @@ def main() -> int:
                 if not user_text:
                     continue
 
-                print(f"telegram<{chat_id}> {user_text[:100]}")
+                print(f"telegram<{chat_id}> {user_text[:100]}", flush=True)
 
                 if user_text in {"/start", "/help"}:
                     send_message(token, chat_id, _help_text(agent.name))
@@ -185,12 +219,38 @@ def main() -> int:
                         metadata={"surface": "telegram", "chat_id": chat_id},
                     )
                 except Exception as exc:
+                    import traceback
+                    traceback.print_exc()
                     send_message(token, chat_id, f"Error: {exc}")
                 else:
-                    send_message(token, chat_id, str(reply.get("content", "")))
+                    summary = _summarize_telegram_reply(reply)
+                    if summary:
+                        try:
+                            send_message(token, chat_id, summary)
+                        except Exception as exc2:
+                            import traceback
+                            print(f"send_message failed: {exc2}", flush=True)
+                            traceback.print_exc()
+                    else:
+                        content = str(reply.get("content", "")).strip()
+                        if content:
+                            try:
+                                send_message(token, chat_id, content)
+                            except Exception as exc2:
+                                import traceback
+                                print(f"send_message (raw) failed: {exc2}", flush=True)
+                                traceback.print_exc()
                 finally:
                     stop.set()
                     pulse.join(timeout=0.2)
+        except error.HTTPError as exc:
+            if exc.code == 409:
+                # Another long-poll is active — wait and retry
+                import sys; print("telegram> 409 conflict — retrying", flush=True)
+                time.sleep(3)
+                continue
+            import sys; print(f"telegram> HTTP {exc.code}: {exc.reason}", flush=True)
+            time.sleep(5)
         except error.URLError as exc:
             print(f"telegram> network error: {exc.reason}")
             time.sleep(5)

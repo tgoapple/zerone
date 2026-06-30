@@ -2,7 +2,9 @@
 
 ZEROne is a portable character runtime for LLM agents. The core idea: define a persona once in a spec file, and the **character adapter** enforces it on every model response — regardless of which provider is underneath.
 
-Switch from DeepSeek to OpenAI to Ollama. The character stays the same.
+Switch from DeepSeek to OpenAI to Ollama to Codex. The character stays the same.
+
+Visual asks can also auto-route through Codex without permanently switching your main provider, so ZEROne can stay fast for normal chat and still borrow the stronger visual lane when needed.
 
 ## What makes it different
 
@@ -24,6 +26,7 @@ python3 cli.py
 python3 cli.py --provider openai --model gpt-4o-mini
 python3 cli.py --provider ollama --model qwen2.5:7b
 python3 cli.py --provider deepseek --model deepseek-v4-flash
+python3 cli.py --provider codex --model gpt-5.4
 
 # One-shot reply and exit
 python3 cli.py --one-shot "Who are you?"
@@ -61,7 +64,7 @@ What it does:
 | `/status` | Runtime info (provider, model, session, mode) |
 | `/history` | Last 8 turns of conversation |
 | `/mode <name>` | Switch mode: companion, operator, teacher, brainstorm, reflect |
-| `/provider <name>` | Switch provider: deepseek, openai, ollama |
+| `/provider <name>` | Switch provider: deepseek, openai, ollama, codex |
 | `/model <name>` | Switch model |
 | `/skills` | List available skills |
 | `/skill +<name>` | Activate a skill |
@@ -100,18 +103,25 @@ OPENAI_API_KEY=sk-...
 # Optional overrides
 MIP_DEEPSEEK_MODEL=deepseek-chat
 MIP_OPENAI_MODEL=gpt-4o-mini
+MIP_CODEX_MODEL=gpt-5.4
+MIP_VISUAL_PROVIDER=codex
 MIP_WORKSPACE_ROOT=/path/to/workspace
+UNSPLASH_ACCESS_KEY=your-unsplash-access-key
 
 # Ollama
 OLLAMA_BASE_URL=http://localhost:11434
 ```
+
+`codex` does not need an API key if the local Codex CLI is already logged in with ChatGPT. Check with `codex login status`.
+
+If `UNSPLASH_ACCESS_KEY` is set, ZEROne can pull a relevant real image reference for landing-page work and feed it into the page generator instead of relying on placeholder imagery.
 
 ## Architecture
 
 ```
 cli.py / telegram_bot.py
     └── zerone.py (ZEROne class)
-            ├── providers.py (OpenAI, DeepSeek, Ollama with retry)
+            ├── providers.py (OpenAI, DeepSeek, Ollama, Codex with retry)
             ├── character_adapter.py (persona enforcement pipeline)
             ├── persona.zeron.spec.json (persona definition)
             ├── prompt-template.txt (system prompt template)
