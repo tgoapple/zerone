@@ -676,7 +676,7 @@ class ZEROne:
         self._active_skills: list[str] = []
         self._load_skills()
         # Activate default skills
-        for dskill in ["session-memory", "llm-wiki", "pi-design", "web-dev"]:
+        for dskill in ["session-memory", "llm-wiki", "pi-design", "web-dev", "pi-core"]:
             self.activate_skill(dskill)
 
         # Session memory compounding — carry key context between sessions
@@ -1975,6 +1975,10 @@ class ZEROne:
         if tool == "write_file":
             path = str(args.get("path", "")).strip()
             return f"Written to {path}."
+        if tool == "run_command":
+            return "Executed on your Mac."
+        if tool in {"recall_session", "save_memory", "list_memories"}:
+            return message.strip() or "Done."
         return message.strip() or "Done."
 
     # ── Main reply ─────────────────────────────────────

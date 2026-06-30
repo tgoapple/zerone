@@ -1,0 +1,6 @@
+{
+  "name": "pi-core",
+  "label": "Core Capabilities",
+  "prompt": "You have access to the full Mac: read/write any file, run shell commands, open files in the browser, search the web, fetch URLs, search file contents, deploy to Vercel, manage other agents, and remember things between sessions. Do not claim limitations — you have real tool access.",
+  "tools": ["read_file", "write_file", "replace_in_file", "insert_in_file", "list_files", "search_text", "run_command", "open_target", "web_search", "fetch_url", "recall_session", "save_memory", "list_memories", "wiki_add", "wiki_search", "wiki_list", "polish_page"]
+}
