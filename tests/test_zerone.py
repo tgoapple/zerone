@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 from unittest.mock import patch
 from pathlib import Path
@@ -187,6 +188,106 @@ class TestOpenTarget:
         run.assert_called_once_with(["open", "-a", "Terminal"], check=True, timeout=5)
         assert result == "Opened application Terminal"
 
+    def test_web_search_parses_results(self, tmp_dir):
+        from zerone import _build_workspace_tools
+        reg, _ = _build_workspace_tools(tmp_dir)
+        tool = reg.get("web_search")
+        assert tool is not None
+
+        html = """
+        <html><body>
+        <a class="result__a" href="https://example.com/one">First Result</a>
+        <a class="result__a" href="https://example.com/two">Second Result</a>
+        </body></html>
+        """
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return html.encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=FakeResponse()):
+            result = tool["handler"]("zerone", 2)
+        assert "First Result" in result
+        assert "https://example.com/two" in result
+
+    def test_fetch_url_summarizes_page(self, tmp_dir):
+        from zerone import _build_workspace_tools
+        reg, _ = _build_workspace_tools(tmp_dir)
+        tool = reg.get("fetch_url")
+        assert tool is not None
+
+        html = """
+        <html>
+          <head>
+            <title>Agznko Preview</title>
+            <meta name="description" content="Creative agency preview">
+          </head>
+          <body class="dark hero-grid portfolio-masonry">
+            <h1>We build sharp brands</h1>
+            <h2>Selected work</h2>
+          </body>
+        </html>
+        """
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return html.encode("utf-8")
+
+        with patch("urllib.request.urlopen", return_value=FakeResponse()):
+            result = tool["handler"]("https://example.com/preview", 4000)
+        assert "Title: Agznko Preview" in result
+        assert "Creative agency preview" in result
+        assert "Selected work" in result
+        assert "portfolio-masonry" in result
+
+    def test_inspect_reference_url_formats_rendered_summary(self, tmp_dir):
+        from zerone import ZEROne, Config
+        z = ZEROne(Config(data_dir=tmp_dir, workspace_root=str(tmp_dir), persona_path=Path(__file__).resolve().parent.parent / "persona.zeron.spec.json"))
+        tool = z._tools.get("inspect_reference_url")
+        assert tool is not None
+
+        payload = {
+            "title": "Agznko Preview",
+            "description": "Creative agency preview",
+            "bodyBackground": "rgb(10, 10, 10)",
+            "bodyColor": "rgb(245, 245, 245)",
+            "bodyFont": "Montserrat, sans-serif",
+            "bodyIsDark": True,
+            "classTokens": ["hero", "dark", "portfolio", "masonry"],
+            "headings": ["We build sharp brands", "Selected work"],
+            "links": ["Work", "Contact"],
+            "sectionCount": 5,
+            "imageCount": 9,
+            "hero": {
+                "selector": "[class*=hero]",
+                "height": 980,
+                "backgroundColor": "rgb(12, 12, 12)",
+                "backgroundImage": "url(hero.jpg)",
+                "textAlign": "left",
+                "className": "hero dark overlay",
+                "heading": "We build sharp brands",
+            },
+            "snippet": "Creative agency portfolio with dark full-screen hero.",
+        }
+
+        with patch("subprocess.run", return_value=subprocess.CompletedProcess(args=[], returncode=0, stdout=json.dumps(payload), stderr="")):
+            result = tool["handler"]("https://example.com/reference", 5000)
+        assert "Dark page: yes" in result
+        assert "Hero cues:" in result
+        assert "We build sharp brands" in result
+
 
 # ── ZEROne ──────────────────────────────────────────────────
 
@@ -211,6 +312,16 @@ class TestZEROneCore:
         z.set_provider("openai")
         assert z.provider.name == "openai"
 
+    def test_set_provider_uses_saved_model_per_provider(self, z):
+        z.set_model("deepseek-v4-flash")
+        z.set_provider("openai")
+        assert z.provider.name == "openai"
+        assert z.provider.model == "gpt-4o-mini"
+        z.set_model("gpt-4.1-mini")
+        z.set_provider("deepseek")
+        assert z.provider.name == "deepseek"
+        assert z.provider.model == "deepseek-v4-flash"
+
     def test_set_model(self, z):
         z.set_model("gpt-4o-mini")
         assert z.provider.model == "gpt-4o-mini"
@@ -218,6 +329,23 @@ class TestZEROneCore:
     def test_set_mode(self, z):
         z.set_mode("teacher")
         assert z.config.companion_mode == "teacher"
+
+    def test_visual_request_prefers_visual_provider(self, z, monkeypatch):
+        class StubProvider:
+            def __init__(self, name: str, model: str | None = None):
+                self.name = name
+                self.model = model
+
+        monkeypatch.setattr("zerone.build_provider", lambda name, model=None: StubProvider(name, model))
+        z.provider = StubProvider("deepseek", "deepseek-v4-flash")
+        z._provider_models = {"deepseek": "deepseek-v4-flash"}
+
+        routed = z._provider_for_request("create a logo for ZER0ne")
+        assert routed.name == "codex"
+
+    def test_non_visual_request_stays_on_current_provider(self, z):
+        routed = z._provider_for_request("help me think this through")
+        assert routed is z.provider
 
     def test_remember_and_forget(self, z):
         r = z.remember("my name is Gary")
@@ -271,6 +399,16 @@ class TestZEROneCore:
         assert _extract_html(text) == "<h1>Hello</h1>"
         assert _extract_html("no html") is None
 
+    def test_looks_like_code_dump(self):
+        from zerone import _looks_like_code_dump
+        assert _looks_like_code_dump("```html\n<h1>Hello</h1>\n```") is True
+        assert _looks_like_code_dump("<!DOCTYPE html><html></html>") is True
+        assert _looks_like_code_dump("plain text") is False
+
+    def test_clean_visual_query(self):
+        from zerone import _clean_visual_query
+        assert _clean_visual_query("create a coconut green landing page with luxury skincare photography") == "coconut green luxury skincare photography"
+
     def test_strip_fences(self):
         from zerone import _strip_fences
         assert _strip_fences("```json\n{\"key\": \"value\"}\n```") == '{"key": "value"}'
@@ -292,6 +430,13 @@ class TestZEROneCore:
         session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}
         open_args = z._normalize_tool_args("open_target", {"path": "mip-framework/index.html"}, session=session)
         assert open_args == {"target": "mip-framework/index.html"}
+        design_args = z._normalize_tool_args(
+            "design_landing_page",
+            {"title": "MIP Framework", "tagline": "Mindful. Intentional. Precise."},
+            session=session,
+        )
+        assert design_args["path"] == "mip-framework/index.html"
+        assert design_args["style"] == "auto"
         build_args = z._normalize_tool_args(
             "build_landing_page",
             {"title": "MIP Framework", "tagline": "Mindful. Intentional. Precise."},
@@ -319,7 +464,7 @@ class TestZEROneCore:
 
         def fake_call_tool(name, args):
             calls.append((name, args))
-            if name == "build_landing_page":
+            if name == "design_landing_page":
                 return f"created landing page at {args['path']}"
             return ""
 
@@ -333,8 +478,8 @@ class TestZEROneCore:
         assert result is not None
         assert result["message"] == "Created and opened mip-framework/index.html."
         assert calls == [(
-            "build_landing_page",
-            {"path": "mip-framework/index.html", "brief": "create a landing page and open it", "mode": "create", "open_after": True},
+            "design_landing_page",
+            {"path": "mip-framework/index.html", "brief": "create a landing page and open it", "mode": "create", "style": "auto", "open_after": True},
         )]
 
     def test_operator_shortcut_improve_last_target(self, z, monkeypatch):
@@ -342,7 +487,7 @@ class TestZEROneCore:
 
         def fake_call_tool(name, args):
             calls.append((name, args))
-            if name == "build_landing_page":
+            if name == "design_landing_page":
                 return f"improved landing page at {args['path']}"
             return ""
 
@@ -358,8 +503,8 @@ class TestZEROneCore:
         assert result is not None
         assert result["message"] == "Improved and opened mip-framework/index.html."
         assert calls == [(
-            "build_landing_page",
-            {"path": "mip-framework/index.html", "brief": "now improve it, do a second pass and wow me", "mode": "improve", "open_after": True},
+            "design_landing_page",
+            {"path": "mip-framework/index.html", "brief": "now improve it, do a second pass and wow me", "mode": "improve", "style": "auto", "open_after": True},
         )]
 
     def test_operator_shortcut_take_another_pass(self, z, monkeypatch):
@@ -367,7 +512,7 @@ class TestZEROneCore:
 
         def fake_call_tool(name, args):
             calls.append((name, args))
-            if name == "build_landing_page":
+            if name == "design_landing_page":
                 return f"improved landing page at {args['path']}"
             return ""
 
@@ -382,7 +527,7 @@ class TestZEROneCore:
 
         assert result is not None
         assert result["message"] == "Improved and opened mip-framework/index.html."
-        assert calls[0][0] == "build_landing_page"
+        assert calls[0][0] == "design_landing_page"
 
     def test_operator_shortcut_open_last_target(self, z, monkeypatch):
         calls = []
@@ -402,6 +547,120 @@ class TestZEROneCore:
         assert result["message"] == "Opened mip-framework/index.html in the browser."
         assert calls == [("open_target", {"target": "mip-framework/index.html"})]
 
+    def test_reply_telegram_html_fallback_writes_and_opens(self, z, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(
+            z.provider,
+            "generate",
+            lambda *args, **kwargs: "```html\n<!DOCTYPE html><html><body><h1>Hello</h1></body></html>\n```",
+        )
+
+        def fake_call_tool(name, args):
+            calls.append((name, args))
+            if name == "write_file":
+                return "wrote 1 lines"
+            if name == "open_target":
+                return "Opened mip-framework/index.html"
+            return ""
+
+        monkeypatch.setattr(z, "_call_tool", fake_call_tool)
+
+        reply = z.reply("telegram-fallback", "hello", metadata={"surface": "telegram", "chat_id": 1})
+
+        assert reply["content"] == "Opened mip-framework/index.html on this Mac."
+        assert calls == [
+            ("write_file", {"path": "mip-framework/index.html", "content": "<!DOCTYPE html><html><body><h1>Hello</h1></body></html>"}),
+            ("open_target", {"target": "mip-framework/index.html"}),
+        ]
+
+    def test_generate_page_html_includes_unsplash_reference(self, z, monkeypatch):
+        captured: dict[str, Any] = {}
+
+        monkeypatch.setattr(
+            z,
+            "_fetch_unsplash_reference",
+            lambda task, target: {
+                "query": "coconut green skincare",
+                "image_url": "https://images.unsplash.com/example",
+                "photographer": "Alex Example",
+                "photographer_url": "https://unsplash.com/@alexexample",
+            },
+        )
+
+        def fake_generate(system_prompt, messages):
+            captured["system"] = system_prompt
+            captured["user"] = messages[0]["content"]
+            return "<!DOCTYPE html><html></html>"
+
+        monkeypatch.setattr(z.provider, "generate", fake_generate)
+        html = z._generate_page_html("create a coconut green landing page", "index.html")
+
+        assert html == "<!DOCTYPE html><html></html>"
+        assert "Unsplash image reference" in captured["user"]
+        assert "https://images.unsplash.com/example" in captured["user"]
+        assert "Alex Example" in captured["user"]
+
+    def test_analyze_reference_url_builds_summary(self, z, monkeypatch):
+        fetched = (
+            "URL: https://example.com/ref\n\n"
+            "Title: Agznko Preview\n\n"
+            "Description: Creative agency preview\n\n"
+            "Headings:\n- We build sharp brands\n- Selected work\n\n"
+            "Class tokens:\nhero, dark, portfolio, masonry, overlay, agency\n\n"
+            "Text snippet:\nCreative agency portfolio with hover interactions and selected work."
+        )
+        monkeypatch.setattr(z, "_call_tool", lambda name, args: fetched if name == "fetch_url" else "")
+        result = z._analyze_reference_url("inspect this https://example.com/ref and rebuild it")
+        assert result is not None
+        assert result["url"] == "https://example.com/ref"
+        assert "dark, high-contrast visual tone" in result["summary"]
+        assert "portfolio or masonry-style grid section" in result["summary"]
+
+    def test_analyze_reference_url_prefers_inspector_output(self, z, monkeypatch):
+        inspected = (
+            "URL: https://example.com/ref\n\n"
+            "Title: Agznko Preview\n\n"
+            "Description: Creative agency preview\n\n"
+            "Dark page: yes\n\n"
+            "Hero cues:\n- selector: [class*=hero]\n- height: 980px\n- heading: We build sharp brands\n- background color: rgb(12, 12, 12)\n- background image: url(hero.jpg)\n- text align: left\n- classes: hero dark overlay\n\n"
+            "Headings:\n- We build sharp brands\n- Selected work\n\n"
+            "Class tokens:\nhero, dark, portfolio, masonry, overlay, agency\n\n"
+            "Text snippet:\nCreative agency portfolio with hover interactions and selected work."
+        )
+        monkeypatch.setattr(z, "_call_tool", lambda name, args: inspected if name == "inspect_reference_url" else "")
+        result = z._analyze_reference_url("inspect this https://example.com/ref and rebuild it")
+        assert result is not None
+        assert "Overall: dark rendered page" in result["summary"]
+        assert "Hero: We build sharp brands" in result["summary"]
+        assert "Hero background uses an image treatment" in result["summary"]
+
+    def test_generate_page_html_includes_reference_analysis(self, z, monkeypatch):
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(z, "_fetch_unsplash_reference", lambda task, target: None)
+        monkeypatch.setattr(
+            z,
+            "_analyze_reference_url",
+            lambda task: {
+                "url": "https://example.com/ref",
+                "summary": "Mood: dark, high-contrast visual tone\nLayout: full-screen or oversized hero section",
+            },
+        )
+
+        def fake_generate(system_prompt, messages):
+            captured["user"] = messages[0]["content"]
+            return "<!DOCTYPE html><html></html>"
+
+        monkeypatch.setattr(z.provider, "generate", fake_generate)
+        html = z._generate_page_html(
+            "use https://example.com/ref as the reference for this landing page",
+            "index.html",
+            specialist=True,
+        )
+        assert html == "<!DOCTYPE html><html></html>"
+        assert "Reference site analysis" in captured["user"]
+        assert "full-screen or oversized hero section" in captured["user"]
+
 
 # ── Skills ──────────────────────────────────────────────────
 
@@ -413,13 +672,23 @@ class TestSkills:
         names = [s["name"] for s in skills]
         assert "web-dev" in names
         assert "debug" in names
+        assert "design" in names
         assert "landing-pages" in names
+        assert "research" in names
+        assert "reference-browser" in names
 
     def test_activate_deactivate(self, z):
+        # web-dev is now active by default, deactivate first
+        if "web-dev" in z._active_skills:
+            z.deactivate_skill("web-dev")
         assert z.activate_skill("web-dev") is True
         assert z.activate_skill("web-dev") is False  # already active
         assert z.deactivate_skill("web-dev") is True
         assert z.deactivate_skill("web-dev") is False  # already inactive
+
+    def test_default_skills_active(self, z):
+        for dskill in ["session-memory", "llm-wiki", "pi-design", "web-dev"]:
+            assert dskill in z._active_skills, f"{dskill} should be active by default"
 
     def test_unknown_skill(self, z):
         assert z.activate_skill("nonexistent") is False
@@ -442,7 +711,7 @@ class TestSkills:
     def test_landing_pages_skill_adds_tool(self, z):
         z.set_skills(["landing-pages"])
         names = z._active_tool_names()
-        assert "build_landing_page" in names
+        assert "design_landing_page" in names
 
     def test_auto_skill_names_for_landing_page(self, z):
         session = {"id": "test", "messages": [], "meta": {}}
@@ -450,10 +719,21 @@ class TestSkills:
         assert "landing-pages" in names
         assert "landing-pages" not in z._active_skills
 
+    def test_auto_skill_names_for_web_research(self, z):
+        session = {"id": "test", "messages": [], "meta": {}}
+        names = z._auto_skill_names("search the web for the latest OpenAI news", session=session)
+        assert "research" in names
+
+    def test_auto_skill_names_for_reference_url(self, z):
+        session = {"id": "test", "messages": [], "meta": {}}
+        names = z._auto_skill_names("inspect this https://example.com/reference and rebuild the page in that style", session=session)
+        assert "reference-browser" in names
+
     def test_rank_toolkit_routes_prefers_landing_pages(self, z):
         session = {"id": "test", "messages": [], "meta": {}}
         ranked = z._rank_toolkit_routes("create a responsive landing page in html", session=session)
-        assert ranked[0][0] == "landing-pages"
+        assert ranked[0][0] in {"design", "landing-pages"}
+        assert any(name == "design" for name, _score in ranked)
         assert any(name == "web-dev" for name, _score in ranked)
 
     def test_auto_skill_names_caps_at_two(self, z):
@@ -466,7 +746,7 @@ class TestSkills:
         session = {"id": "test", "messages": [], "meta": {}}
         names = z._effective_skill_names("create a landing page in html", session=session)
         assert "web-dev" in names
-        assert "landing-pages" not in names
+        assert any(name in names for name in {"design", "landing-pages"})
 
     def test_html_followup_auto_selects_landing_pages(self, z):
         session = {"id": "test", "messages": [], "meta": {"last_operator_target": "mip-framework/index.html"}}

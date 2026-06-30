@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from telegram_bot import _build_agent, _chunk_text, _help_text, _status_text
+from telegram_bot import _build_agent, _chunk_text, _help_text, _status_text, _summarize_telegram_reply
 
 
 def test_chunk_text_keeps_short_text():
@@ -37,3 +37,20 @@ def test_status_text_includes_provider_and_workspace(tmp_path: Path):
     assert "provider: deepseek" in text
     assert "workspace:" in text
     assert str(tmp_path) in text
+
+
+def test_summarize_telegram_reply_uses_tool_steps():
+    reply = {
+        "content": "<html>ignored</html>",
+        "meta": {
+            "agent_steps": [
+                {"tool": "open_target", "args": {"target": "mip-framework/index.html"}},
+            ]
+        },
+    }
+    assert _summarize_telegram_reply(reply) == "Opened mip-framework/index.html on this Mac."
+
+
+def test_summarize_telegram_reply_hides_raw_html():
+    reply = {"content": "```html\n<!DOCTYPE html><html></html>\n```", "meta": {}}
+    assert "raw HTML" in _summarize_telegram_reply(reply)

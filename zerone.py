@@ -675,6 +675,9 @@ class ZEROne:
         self._skills: dict[str, dict[str, Any]] = {}
         self._active_skills: list[str] = []
         self._load_skills()
+        # Activate default skills
+        for dskill in ["session-memory", "llm-wiki", "pi-design", "web-dev"]:
+            self.activate_skill(dskill)
 
         # Session memory compounding — carry key context between sessions
         self._session_memory_path = self.config.data_dir / "session-memory.json"
